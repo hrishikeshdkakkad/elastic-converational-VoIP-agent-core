@@ -1,0 +1,51 @@
+# Temporal dynamic configuration for development with SQL/PostgreSQL
+# This file contains runtime configuration that can be changed without restarting Temporal
+
+# Enable search attributes for better workflow filtering
+system.enableNexus:
+  - value: true
+
+# Workflow execution limits
+limit.maxIDLength:
+  - value: 255
+
+# History size limits - important for long-running phone calls
+limit.historySize:
+  - value: 50000
+
+limit.historyCount:
+  - value: 50000
+
+# Blob size limits for audio data
+limit.blobSize.error:
+  - value: 2097152  # 2MB - Twilio sends ~20KB per 640ms chunk
+
+limit.blobSize.warn:
+  - value: 524288  # 512KB
+
+# Concurrent task execution
+limit.workflowConcurrentTaskExecutionSize:
+  - value: 1000
+
+# Task queue configuration
+limit.taskQueuePartitions:
+  - value: 4
+
+# Retention period for completed workflows
+system.forceSearchAttributesCacheRefreshOnRead:
+  - value: false
+
+# Advanced Visibility settings
+system.advancedVisibilityWritingMode:
+  - value: "on"
+
+# Worker polling configuration
+frontend.enableWorkerVersioningDataAPIs:
+  - value: true
+
+# Rate limiting for activities (important for Twilio/Gemini API calls)
+frontend.rps:
+  - value: 2400  # requests per second
+
+# Namespace-specific settings can be added here
+# These are global defaults that apply to all namespaces

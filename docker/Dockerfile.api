@@ -1,0 +1,48 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+# Install system dependencies for audio processing and PostgreSQL client
+RUN apt-get update && apt-get install -y \
+    libsndfile1 \
+    libsox-dev \
+    ffmpeg \
+    postgresql-client \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+# Copy dependency files
+COPY pyproject.toml uv.lock* ./
+
+# Install dependencies
+RUN uv sync --frozen --no-cache
+
+# Copy application code and migrations
+COPY src/ ./src/
+COPY migrations/ ./migrations/
+COPY alembic.ini ./
+COPY scripts/entrypoint.sh /entrypoint.sh
+
+# Make entrypoint executable
+RUN chmod +x /entrypoint.sh
+
+# Create logs directory
+RUN mkdir -p /app/logs
+
+# Expose API port
+EXPOSE 8000
+
+# Set environment variables
+ENV PYTHONPATH=/app \
+    DB_HOST=postgresql \
+    POSTGRES_USER=temporal \
+    POSTGRES_PASSWORD=temporal \
+    POSTGRES_DB=temporal \
+    DATABASE_URL=postgresql://temporal:temporal@postgresql:5432/voice_ai
+
+# Use entrypoint to run migrations before starting API
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["uv", "run", "uvicorn", "src.voice_ai_system.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

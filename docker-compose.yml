@@ -1,0 +1,238 @@
+services:
+  # PostgreSQL database for Temporal and application data
+  postgresql:
+    image: postgres:12
+    container_name: voice-ai-postgresql
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-temporal}
+      POSTGRES_USER: ${POSTGRES_USER:-temporal}
+      POSTGRES_DB: ${POSTGRES_DB:-temporal}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # SQL scripts removed - Alembic migrations handle schema now
+    networks:
+      - voice-ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for session state management
+  redis:
+    image: redis:7.2-alpine
+    container_name: voice-ai-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - voice-ai-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    command: redis-server --appendonly yes
+
+  # Elasticsearch for Temporal Advanced Visibility
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: voice-ai-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - voice-ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Temporal server with auto-setup
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    container_name: voice-ai-temporal
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-temporal}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD:-temporal}
+      - POSTGRES_SEEDS=postgresql
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      # Temporarily disable ES until configuration is ready
+      - ENABLE_ES=false
+      # - ES_SEEDS=elasticsearch
+      # - ES_VERSION=v8
+      # Critical: NUM_HISTORY_SHARDS is immutable after first deployment
+      # 512 shards is good for moderate workloads (hundreds of calls/minute)
+      - NUM_HISTORY_SHARDS=512
+      - SKIP_SCHEMA_SETUP=false
+      - SKIP_DB_CREATE=false
+    ports:
+      - "7233:7233"  # gRPC
+      - "6933:6933"  # Metrics
+    volumes:
+      - ./docker/temporal-config:/etc/temporal/config/dynamicconfig
+    networks:
+      - voice-ai-network
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # Temporal Web UI
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    container_name: voice-ai-temporal-ui
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8080:8080"
+    networks:
+      - voice-ai-network
+
+  # FastAPI application service
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: voice-ai-api
+    depends_on:
+      temporal:
+        condition: service_healthy
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_HOST=temporal
+      - TEMPORAL_PORT=7233
+      - TEMPORAL_NAMESPACE=default
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-temporal}:${POSTGRES_PASSWORD:-temporal}@postgresql:5432/voice_ai
+      - ALEMBIC_DATABASE_URL=postgresql://${POSTGRES_USER:-temporal}:${POSTGRES_PASSWORD:-temporal}@postgresql:5432/voice_ai
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - BASE_URL=${BASE_URL}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+    networks:
+      - voice-ai-network
+    command: ["uv", "run", "uvicorn", "src.voice_ai_system.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  # Temporal worker service
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    depends_on:
+      temporal:
+        condition: service_healthy
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_HOST=temporal
+      - TEMPORAL_PORT=7233
+      - TEMPORAL_NAMESPACE=default
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-temporal}:${POSTGRES_PASSWORD:-temporal}@postgresql:5432/voice_ai
+      - ALEMBIC_DATABASE_URL=postgresql://${POSTGRES_USER:-temporal}:${POSTGRES_PASSWORD:-temporal}@postgresql:5432/voice_ai
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - BASE_URL=${BASE_URL}
+      - WORKER_TASK_QUEUE=voice-ai-task-queue
+      - MAX_CONCURRENT_ACTIVITIES=100
+      - MAX_CONCURRENT_WORKFLOWS=1000
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+    networks:
+      - voice-ai-network
+    deploy:
+      replicas: 2
+    command: ["uv", "run", "python", "-m", "src.voice_ai_system.worker"]
+
+  # Prometheus for metrics (optional but recommended)
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: voice-ai-prometheus
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - voice-ai-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+  # Grafana for visualization (optional but recommended)
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: voice-ai-grafana
+    depends_on:
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana-dashboards:/etc/grafana/provisioning/dashboards
+      - ./docker/grafana-datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - voice-ai-network
+
+networks:
+  voice-ai-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
+  prometheus_data:
+  grafana_data:

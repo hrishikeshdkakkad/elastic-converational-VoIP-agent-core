@@ -1,0 +1,52 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Docker volumes
+postgres_data/
+elasticsearch_data/
+prometheus_data/
+grafana_data/
+
+# macOS
+.DS_Store
+
+# Testing
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Temporal
+.temporal/
+
+# Audio files (temporary)
+*.wav
+*.mp3
+*.mulaw
+temp_audio/
