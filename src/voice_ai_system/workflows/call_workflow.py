@@ -9,7 +9,7 @@ Key changes:
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
@@ -44,6 +44,7 @@ class VoiceCallWorkflow:
         self.status: CallStatus = CallStatus.INITIATED
         self.started_at: Optional[datetime] = None
         self.ended_at: Optional[datetime] = None
+        self.call_initiated_at: Optional[datetime] = None  # Track when call was initiated
 
         # Streaming state
         self.stream_sid: Optional[str] = None
@@ -55,6 +56,7 @@ class VoiceCallWorkflow:
         # Call configuration (for audio_bridge)
         self.greeting: str = ""
         self.system_prompt: Optional[str] = None
+        self.vad_config: Optional[dict] = None
 
         # Control flags
         self.call_ended: bool = False
@@ -72,6 +74,7 @@ class VoiceCallWorkflow:
         self.phone_number = input_data.phone_number
         self.greeting = input_data.greeting
         self.system_prompt = input_data.system_prompt
+        self.vad_config = getattr(input_data, 'vad_config', None)
         self.started_at = workflow.now()
 
         try:
@@ -111,6 +114,7 @@ class VoiceCallWorkflow:
             workflow.logger.info(f"Redis session record created: {self.workflow_id}")
 
             # Step 3: Initiate Twilio call
+            self.call_initiated_at = workflow.now()  # Track initiation time
             result = await workflow.execute_activity(
                 "initiate_twilio_call",
                 args=[
@@ -125,7 +129,24 @@ class VoiceCallWorkflow:
             )
 
             self.call_sid = result["call_sid"]
-            workflow.logger.info(f"Twilio call initiated: {self.call_sid}")
+            workflow.logger.info(f"Twilio call initiated: {self.call_sid} at {self.call_initiated_at}")
+
+            # Create initial metrics record
+            await workflow.execute_activity(
+                "create_or_update_call_metrics",
+                args=[{
+                    "call_id": str(self.call_id),
+                    "workflow_id": self.workflow_id,
+                    "metrics": {
+                        "call_initiated_at": self.call_initiated_at,
+                        "twilio_call_sid": self.call_sid,
+                        "vad_config": self.vad_config,
+                        "gemini_model_version": "gemini-2.5-flash-native-audio-preview-09-2025"
+                    }
+                }],
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
 
             # Step 4: Wait for call to connect with iterative verification
             # Uses multiple shorter timeouts with Twilio API verification to avoid race conditions
@@ -394,6 +415,61 @@ class VoiceCallWorkflow:
         self.call_sid = call_sid
         workflow.logger.info(f"Call SID set: {call_sid}")
 
+    @workflow.signal
+    async def update_metrics(self, metrics_data: dict[str, Any]) -> None:
+        """Signal: Update call metrics."""
+        workflow.logger.info(f"Updating metrics: {metrics_data}")
+
+        def _to_utc_datetime(raw_value: Any, label: str) -> Optional[datetime]:
+            """Convert incoming datetime/string to an aware UTC datetime."""
+            if isinstance(raw_value, datetime):
+                dt = raw_value
+            elif isinstance(raw_value, str):
+                normalized = raw_value.replace("Z", "+00:00") if raw_value.endswith("Z") else raw_value
+                try:
+                    dt = datetime.fromisoformat(normalized)
+                except ValueError:
+                    workflow.logger.error(f"Failed to parse {label} from string: {raw_value}")
+                    return None
+            else:
+                workflow.logger.error(f"Unexpected type for {label}: {type(raw_value)}")
+                return None
+
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+        # Calculate time to WebSocket connection
+        if self.call_initiated_at and "websocket_connected_at" in metrics_data:
+            # Parse timestamps and normalize to UTC-aware datetime to avoid naive/aware subtraction errors
+            raw_timestamp = metrics_data["websocket_connected_at"]
+            call_initiated_utc = _to_utc_datetime(self.call_initiated_at, "call_initiated_at")
+            ws_connected = _to_utc_datetime(raw_timestamp, "websocket_connected_at")
+
+            workflow.logger.info(
+                f"DEBUG: Parsed timestamp - raw='{raw_timestamp}' (type={type(raw_timestamp).__name__}), "
+                f"ws_connected='{ws_connected}', ws_connected.tzinfo={ws_connected.tzinfo if ws_connected else None}, "
+                f"call_initiated_at='{call_initiated_utc}', call_initiated_at.tzinfo={call_initiated_utc.tzinfo if call_initiated_utc else None}"
+            )
+
+            if call_initiated_utc and ws_connected:
+                time_to_websocket_ms = int((ws_connected - call_initiated_utc).total_seconds() * 1000)
+                metrics_data["time_to_websocket_ms"] = time_to_websocket_ms
+                metrics_data["websocket_connected_at"] = ws_connected.isoformat()
+                workflow.logger.info(f"Time to WebSocket: {time_to_websocket_ms}ms")
+
+        # Store call_initiated_at in metrics data
+        if self.call_initiated_at:
+            initiated_at_utc = _to_utc_datetime(self.call_initiated_at, "call_initiated_at")
+            if initiated_at_utc:
+                metrics_data["call_initiated_at"] = initiated_at_utc.isoformat()
+
+        # Update metrics in database
+        await workflow.execute_activity(
+            "update_streaming_metrics",
+            args=[metrics_data],
+            start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
     # === Queries ===
 
     @workflow.query
@@ -408,6 +484,7 @@ class VoiceCallWorkflow:
             "call_id": str(self.call_id) if self.call_id else None,
             "greeting": self.greeting,
             "system_prompt": self.system_prompt,
+            "vad_config": self.vad_config,
         }
 
     @workflow.query

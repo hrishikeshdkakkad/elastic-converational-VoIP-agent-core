@@ -50,6 +50,10 @@ class CallWorkflowInput(BaseModel):
     max_duration_seconds: int = Field(
         default=1800, description="Maximum call duration (30 minutes default)"
     )
+    vad_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Voice Activity Detection configuration (disabled, start_sensitivity, end_sensitivity, etc.)"
+    )
     metadata: dict[str, Any] = Field(
         default_factory=dict, description="Additional metadata for the call"
     )

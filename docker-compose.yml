@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-temporal}
       POSTGRES_DB: ${POSTGRES_DB:-temporal}
     ports:
-      - "5432:5432"
+      - "5433:5432"  # Changed to avoid conflict with local PostgreSQL
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # SQL scripts removed - Alembic migrations handle schema now
@@ -145,6 +145,7 @@ services:
     volumes:
       - ./src:/app/src
       - ./logs:/app/logs
+      - ./migrations:/app/migrations
     networks:
       - voice-ai-network
     command: ["uv", "run", "uvicorn", "src.voice_ai_system.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -185,6 +186,7 @@ services:
     volumes:
       - ./src:/app/src
       - ./logs:/app/logs
+      - ./migrations:/app/migrations
     networks:
       - voice-ai-network
     deploy:

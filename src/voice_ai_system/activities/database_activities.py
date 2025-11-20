@@ -8,7 +8,7 @@ from sqlalchemy import select
 from temporalio import activity
 
 from src.voice_ai_system.services.database import get_db_session
-from src.voice_ai_system.models.database import Call, Transcript, CallEvent
+from src.voice_ai_system.models.database import Call, Transcript, CallEvent, CallMetrics
 from src.voice_ai_system.models.call import CallStatus, Speaker
 
 

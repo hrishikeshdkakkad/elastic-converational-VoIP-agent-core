@@ -7,6 +7,7 @@ https://github.com/google-gemini/cookbook/blob/main/quickstarts/Get_started_Live
 """
 
 import asyncio
+import concurrent.futures
 import logging
 from collections import deque
 from datetime import datetime
@@ -24,10 +25,9 @@ logger = logging.getLogger(__name__)
 # Audio format constants
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
-# Use the correct model for Live API with audio
-# Note: gemini-2.0-flash-live-001 is from cookbook, but docs show gemini-2.5-flash-native-audio-preview
-# Let's use 2.0 as it's confirmed working in Google's cookbook
-MODEL = "models/gemini-2.5-flash-native-audio-preview-09-2025"
+# Use a known-good Gemini Live Audio model
+# This model is confirmed to stream audio responses in current Live API rollout.
+MODEL = "models/gemini-2.0-flash-live-001"
 
 
 class AudioBridgeSession:
@@ -53,16 +53,68 @@ class AudioBridgeSession:
         self._greeting = ""
         self._system_prompt = None
 
+        # ThreadPoolExecutor for CPU-bound audio processing
+        # Use 2 workers: one for encoding (Twilio->Gemini), one for decoding (Gemini->Twilio)
+        self._audio_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix=f"audio-{session_id[:8]}"
+        )
+
+        # VAD configuration (with defaults)
+        self._vad_config = {
+            "disabled": False,
+            "start_sensitivity": "LOW",  # Will be converted to enum
+            "end_sensitivity": "LOW",    # Will be converted to enum
+            "prefix_padding_ms": 100,
+            "silence_duration_ms": 700
+        }
+
         # Monitoring counters for backpressure detection
-        self.total_frames = 0
+        self.total_frames_sent = 0  # Frames sent to Gemini (from Twilio)
+        self.total_frames_received = 0  # Frames received from Gemini
         self.dropped_frames = 0
 
-    async def start(self, greeting: str = "", system_prompt: Optional[str] = None):
-        """Connect to Gemini Live API and start processing loops."""
+        # Timing metrics
+        self.first_audio_frame_at: Optional[datetime] = None
+        self.session_started_at: Optional[datetime] = None
+        self._initial_prompt_sent: bool = False
+
+        # Queue depth tracking
+        self.max_queue_depth = 0
+        self.queue_depth_sum = 0
+        self.queue_depth_samples = 0
+
+        # Turn and interaction tracking
+        self.ai_turn_count = 0
+        self.user_turn_count = 0
+        self.interruption_count = 0
+
+        # Track user and AI transcripts separately for turn counting
+        self._last_speaker: Optional[Speaker] = None
+
+    async def start(self, greeting: str = "", system_prompt: Optional[str] = None, vad_config: Optional[dict] = None):
+        """Connect to Gemini Live API and start processing loops.
+
+        Args:
+            greeting: Initial greeting message
+            system_prompt: System instructions for the AI
+            vad_config: Optional VAD configuration override with keys:
+                - disabled: bool (default False)
+                - start_sensitivity: "HIGH" or "LOW" (default "LOW")
+                - end_sensitivity: "HIGH" or "LOW" (default "LOW")
+                - prefix_padding_ms: int (default 100)
+                - silence_duration_ms: int (default 700)
+        """
         logger.info("Starting audio bridge session %s", self.session_id)
 
+        self.session_started_at = datetime.utcnow()
         self._greeting = greeting
         self._system_prompt = system_prompt
+
+        # Update VAD config if provided
+        if vad_config:
+            self._vad_config.update(vad_config)
+            logger.debug(f"VAD config updated: {self._vad_config}")
 
         # Start the session runner task (uses async with properly)
         self.session_task = asyncio.create_task(self._run_session())
@@ -73,9 +125,11 @@ class AudioBridgeSession:
     async def _run_session(self):
         """Run the Gemini Live API session with proper async context management."""
         # Build system instruction
+        # Note: Greeting is now handled by Twilio's <Say> verb in TwiML for instant response
         system_text = self._system_prompt or "You are a helpful voice assistant. Be concise and natural."
+        logger.debug(f"System prompt: {system_text[:100]}...")
 
-        # Use simple dict config like Google's example
+        # Configure VAD for optimal voice call experience
         config = {
             "response_modalities": ["AUDIO"],
             "system_instruction": {
@@ -89,7 +143,22 @@ class AudioBridgeSession:
                         }
                     }
                 }
-            }
+            },
+            # Voice Activity Detection configuration
+            "realtime_input_config": {
+                "automatic_activity_detection": {
+                    "disabled": self._vad_config.get("disabled", False),
+                    "start_of_speech_sensitivity": types.StartSensitivity.START_SENSITIVITY_LOW if self._vad_config.get('start_sensitivity', 'LOW').upper() == 'LOW' else types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    "end_of_speech_sensitivity": types.EndSensitivity.END_SENSITIVITY_LOW if self._vad_config.get('end_sensitivity', 'LOW').upper() == 'LOW' else types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    "prefix_padding_ms": self._vad_config.get("prefix_padding_ms", 100),
+                    "silence_duration_ms": self._vad_config.get("silence_duration_ms", 700)
+                },
+                "activity_handling": types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,  # Allow barge-in (interruption)
+                "turn_coverage": types.TurnCoverage.TURN_INCLUDES_ALL_INPUT  # Include all input in user's turn
+            },
+            # Enable transcription for debugging and logging
+            "input_audio_transcription": {},
+            "output_audio_transcription": {}
         }
 
         logger.info("Connecting to Gemini Live API...")
@@ -98,7 +167,10 @@ class AudioBridgeSession:
             # CRITICAL: Use async with properly (like Google's example)
             async with self.client.aio.live.connect(model=MODEL, config=config) as session:
                 self.session = session
-                logger.info("Gemini Live API session connected successfully")
+                logger.info("Gemini Live API connected (session=%s, VAD enabled)", self.session_id)
+
+                # Proactively kick off the first assistant turn so we don't wait on VAD silence
+                await self._send_initial_prompt()
 
                 # Start processing tasks within the session context
                 async with asyncio.TaskGroup() as tg:
@@ -106,11 +178,49 @@ class AudioBridgeSession:
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
+                    tg.create_task(self._ensure_first_audio_frame())
 
         except Exception as exc:
             logger.error(f"Session error: {exc}")
             import traceback
             traceback.print_exc()
+
+    async def _send_initial_prompt(self, force: bool = False):
+        """Send a greeting to force Gemini to speak even if no user audio is detected yet."""
+        if not self.session:
+            return
+
+        if self._initial_prompt_sent and not force:
+            return
+
+        greeting_text = self._greeting.strip() if self._greeting else ""
+        if not greeting_text:
+            greeting_text = "Hello! How can I help you today?"
+
+        try:
+            await self.session.send(input=greeting_text, end_of_turn=True)
+            self._initial_prompt_sent = True
+            logger.info("Sent initial prompt to Gemini to kick off first turn")
+        except Exception as exc:
+            logger.warning("Failed to send initial prompt to Gemini: %s", exc)
+
+    async def _ensure_first_audio_frame(self):
+        """
+        Watchdog: if Gemini hasn't produced audio soon after connect, nudge with the greeting again.
+        """
+        for delay_secs in (3, 8):
+            await asyncio.sleep(delay_secs)
+            if not self.active or self.first_audio_frame_at is not None:
+                return
+
+            logger.info(
+                "No Gemini audio after %ss; sending greeting again to unblock first turn",
+                delay_secs,
+            )
+            await self._send_initial_prompt(force=True)
+
+        if self.active and self.first_audio_frame_at is None:
+            logger.warning("Still no audio from Gemini after proactive greeting attempts")
 
     async def stop(self):
         """Stop the audio bridge session."""
@@ -127,45 +237,96 @@ class AudioBridgeSession:
             except Exception as exc:
                 logger.warning("Error stopping session task: %s", exc)
 
+        # Shutdown thread pool executor
+        # wait=False to avoid blocking, but give it a chance to finish current tasks
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._audio_executor.shutdown, False)
+            logger.debug("Audio executor shutdown for session %s", self.session_id)
+        except Exception as exc:
+            logger.warning("Error shutting down audio executor: %s", exc)
+
     async def send_audio_from_twilio(self, audio_data: str):
-        """Receive audio from Twilio and queue it for sending to Gemini."""
+        """Receive audio from Twilio and queue it for sending to Gemini.
+
+        Uses ThreadPoolExecutor to offload CPU-heavy decoding/resampling off the event loop.
+        Implements early backpressure: drops frames if queue is >80% full before processing.
+        """
         if not self.active:
             return
 
         try:
-            self.total_frames += 1
+            self.total_frames_sent += 1
 
-            # Convert Twilio audio to Gemini format
-            pcm_audio = twilio_to_gemini(audio_data)
+            # Early backpressure: check queue depth BEFORE doing expensive processing
+            queue_depth = self.out_queue.qsize()
+            queue_utilization = queue_depth / self.out_queue.maxsize
 
-            # Queue it for sending (non-blocking to prevent backpressure)
-            # If queue is full, just drop the frame - real-time audio can tolerate some loss
+            # Drop frame early if queue is >80% full to prevent wasting CPU on frames we'll drop anyway
+            if queue_utilization > 0.8:
+                self.dropped_frames += 1
+                drop_rate = (self.dropped_frames / self.total_frames_sent) * 100
+
+                if self.dropped_frames % 10 == 1:  # Log every 10th drop to reduce log spam
+                    logger.warning(
+                        "Dropped frame (early backpressure): queue %d/%d (%.0f%% full), "
+                        "drop rate %.1f%%",
+                        queue_depth, self.out_queue.maxsize,
+                        queue_utilization * 100, drop_rate
+                    )
+                return
+
+            # Offload CPU-heavy audio conversion to thread pool
+            loop = asyncio.get_event_loop()
+            pcm_audio = await loop.run_in_executor(
+                self._audio_executor,
+                twilio_to_gemini,
+                audio_data
+            )
+
+            if self.total_frames_sent % 50 == 0:
+                logger.info(
+                    "Twilio inbound frames=%d queue=%d/%d (session=%s)",
+                    self.total_frames_sent,
+                    self.out_queue.qsize(),
+                    self.out_queue.maxsize,
+                    self.session_id,
+                )
+
+            # Queue it for sending (non-blocking to prevent further backpressure)
+            # If queue is full at this point, drop the frame - real-time audio tolerates some loss
             try:
                 # Use types.Blob format as per official docs
                 audio_blob = types.Blob(data=pcm_audio, mime_type="audio/pcm;rate=16000")
                 self.out_queue.put_nowait(audio_blob)
+
+                # Track queue depth for metrics
+                queue_depth = self.out_queue.qsize()
+                self.max_queue_depth = max(self.max_queue_depth, queue_depth)
+                self.queue_depth_sum += queue_depth
+                self.queue_depth_samples += 1
+
             except asyncio.QueueFull:
                 self.dropped_frames += 1
-                queue_depth = self.out_queue.qsize()
-                drop_rate = (self.dropped_frames / self.total_frames) * 100
+                drop_rate = (self.dropped_frames / self.total_frames_sent) * 100
 
                 # Log warning with backpressure metrics
                 logger.warning(
-                    "Dropped audio frame due to queue full. "
-                    "Queue: %d/%d, Dropped: %d/%d (%.1f%%)",
-                    queue_depth,
+                    "Dropped frame (queue full after processing): queue %d/%d, "
+                    "dropped %d/%d (%.1f%%)",
+                    self.out_queue.maxsize,
                     self.out_queue.maxsize,
                     self.dropped_frames,
-                    self.total_frames,
+                    self.total_frames_sent,
                     drop_rate
                 )
         except Exception as exc:
             logger.error("Error queuing audio from Twilio: %s", exc)
 
-    async def receive_audio_for_twilio(self) -> Optional[str]:
+    async def receive_audio_for_twilio(self, timeout: float = 0.01) -> Optional[str]:
         """Get audio from Gemini to send to Twilio."""
         try:
-            return await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.01)
+            return await asyncio.wait_for(self.audio_in_queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
 
@@ -178,8 +339,13 @@ class AudioBridgeSession:
     def get_metrics(self) -> dict:
         """Get current audio bridge metrics for monitoring."""
         drop_rate = (
-            (self.dropped_frames / self.total_frames * 100)
-            if self.total_frames > 0
+            (self.dropped_frames / self.total_frames_sent * 100)
+            if self.total_frames_sent > 0
+            else 0.0
+        )
+        avg_queue_depth = (
+            (self.queue_depth_sum / self.queue_depth_samples)
+            if self.queue_depth_samples > 0
             else 0.0
         )
         return {
@@ -188,9 +354,17 @@ class AudioBridgeSession:
             "queue_utilization": (
                 self.out_queue.qsize() / self.out_queue.maxsize * 100
             ),
-            "total_frames": self.total_frames,
-            "dropped_frames": self.dropped_frames,
-            "drop_rate_percent": drop_rate,
+            "total_audio_frames_sent": self.total_frames_sent,
+            "total_audio_frames_received": self.total_frames_received,
+            "total_audio_frames_dropped": self.dropped_frames,
+            "audio_drop_rate_percent": drop_rate,
+            "max_audio_queue_depth": self.max_queue_depth,
+            "avg_audio_queue_depth": avg_queue_depth,
+            "ai_turn_count": self.ai_turn_count,
+            "user_turn_count": self.user_turn_count,
+            "interruption_count": self.interruption_count,
+            "first_audio_frame_at": self.first_audio_frame_at.isoformat() if self.first_audio_frame_at else None,
+            "session_started_at": self.session_started_at.isoformat() if self.session_started_at else None,
         }
 
     async def _send_realtime(self):
@@ -198,28 +372,18 @@ class AudioBridgeSession:
         Background task that reads from out_queue and sends to Gemini.
         Uses send_realtime_input as per official docs.
         """
-        logger.info("Starting send_realtime task")
+        logger.info("Starting send_realtime task for session %s", self.session_id)
         chunk_count = 0
         try:
             while self.active:
                 audio_blob = await self.out_queue.get()
-
-                # Debug logging
-                logger.info(f"About to send chunk {chunk_count}: type={type(audio_blob)}, data_len={len(audio_blob.data) if hasattr(audio_blob, 'data') else 'N/A'}")
-
-                # Use send_realtime_input with Blob as per official docs
                 await self.session.send_realtime_input(audio=audio_blob)
                 chunk_count += 1
-                logger.info(f"Successfully sent chunk {chunk_count}")
-
-                if chunk_count % 50 == 0:
-                    logger.debug(f"Sent {chunk_count} audio chunks to Gemini")
 
         except asyncio.CancelledError:
-            logger.info(f"send_realtime task cancelled after {chunk_count} chunks")
+            logger.info(f"send_realtime task completed: {chunk_count} chunks sent")
         except Exception as exc:
             logger.error(f"Error in send_realtime after {chunk_count} chunks: %s", exc)
-            logger.error(f"Last message type: {type(audio_blob)}")
             import traceback
             traceback.print_exc()
 
@@ -238,30 +402,42 @@ class AudioBridgeSession:
         Background task that reads from the websocket and writes PCM chunks to audio_in_queue.
         Based on Google's receive_audio() method.
         """
-        logger.info("Starting receive_audio task")
+        logger.info("Starting receive_audio task for session %s", self.session_id)
         chunk_count = 0
         turn_count = 0
         try:
             while self.active:
-                # CRITICAL: Use session.receive() to get a turn iterator
-                logger.info(f"Waiting for turn {turn_count}...")
                 turn = self.session.receive()
                 turn_count += 1
-                logger.info(f"Got turn {turn_count}, iterating responses...")
 
                 async for response in turn:
                     if not self.active:
                         break
 
-                    logger.debug(f"Received response: type={type(response)}, has_data={hasattr(response, 'data')}, has_text={hasattr(response, 'text')}, has_server_content={hasattr(response, 'server_content')}")
-
                     # Handle audio data (like Google's example)
                     if data := response.data:
+                        logger.info(
+                            "Gemini emitted audio chunk len=%d (session=%s)",
+                            len(data),
+                            self.session_id,
+                        )
                         # Convert Gemini audio to Twilio format
                         try:
-                            twilio_audio = gemini_to_twilio(data)
+                            # Track first audio frame timestamp
+                            if self.first_audio_frame_at is None:
+                                self.first_audio_frame_at = datetime.utcnow()
+                                logger.info(f"First audio frame received at {self.first_audio_frame_at.isoformat()}")
+
+                            # Offload CPU-heavy audio conversion to thread pool
+                            loop = asyncio.get_event_loop()
+                            twilio_audio = await loop.run_in_executor(
+                                self._audio_executor,
+                                gemini_to_twilio,
+                                data
+                            )
                             self.audio_in_queue.put_nowait(twilio_audio)
                             chunk_count += 1
+                            self.total_frames_received += 1
 
                             if chunk_count % 50 == 0:
                                 logger.debug(f"Received {chunk_count} audio chunks from Gemini")
@@ -269,9 +445,15 @@ class AudioBridgeSession:
                             logger.error("Failed to convert Gemini audio: %s", exc)
                         continue
 
-                    # Handle text responses (transcriptions)
+                    # Handle text responses (model-generated text)
                     if text := response.text:
                         logger.info(f"Gemini text: {text}")
+
+                        # Track turn count (new AI response = new AI turn if speaker changed)
+                        if self._last_speaker != Speaker.AI:
+                            self.ai_turn_count += 1
+                            self._last_speaker = Speaker.AI
+
                         self.transcript_buffer.append(
                             TranscriptSegment(
                                 speaker=Speaker.AI,
@@ -280,6 +462,41 @@ class AudioBridgeSession:
                                 confidence=1.0,
                             )
                         )
+
+                    # Handle input transcriptions (user's speech-to-text)
+                    if hasattr(response, 'input_transcription') and response.input_transcription:
+                        transcription = response.input_transcription
+                        if hasattr(transcription, 'text') and transcription.text:
+                            logger.info(f"User transcription: {transcription.text}")
+
+                            # Track turn count (new user input = new user turn if speaker changed)
+                            if self._last_speaker != Speaker.USER:
+                                self.user_turn_count += 1
+                                self._last_speaker = Speaker.USER
+
+                            self.transcript_buffer.append(
+                                TranscriptSegment(
+                                    speaker=Speaker.USER,
+                                    text=transcription.text,
+                                    timestamp=datetime.utcnow(),
+                                    confidence=getattr(transcription, 'confidence', 0.95),
+                                )
+                            )
+
+                    # Handle output transcriptions (AI's text-to-speech)
+                    if hasattr(response, 'output_transcription') and response.output_transcription:
+                        transcription = response.output_transcription
+                        if hasattr(transcription, 'text') and transcription.text:
+                            logger.info(f"AI output transcription: {transcription.text}")
+                            # Store as AI speaker since it's what the AI is saying
+                            self.transcript_buffer.append(
+                                TranscriptSegment(
+                                    speaker=Speaker.AI,
+                                    text=transcription.text,
+                                    timestamp=datetime.utcnow(),
+                                    confidence=1.0,  # AI output is always confident
+                                )
+                            )
 
                     # CRITICAL: Handle interruptions (from Google's example)
                     # "If you interrupt the model, it sends a turn_complete.
@@ -290,20 +507,30 @@ class AudioBridgeSession:
                         server_content = response.server_content
                         logger.info(f"Got server_content: {server_content}")
                         if server_content and getattr(server_content, 'turn_complete', False):
-                            logger.info("Turn complete - clearing audio queue")
-                            # Clear the audio queue on turn complete
-                            while not self.audio_in_queue.empty():
-                                try:
-                                    self.audio_in_queue.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
+                            # IMPORTANT: Don't clear audio queue during pre-warming!
+                            # Pre-warmed sessions don't have a WebSocket yet, so we need to preserve
+                            # the greeting audio for when the call connects.
+                            is_prewarming = self.session_id.startswith("prewarm-")
 
-                logger.info(f"Turn {turn_count} completed")
+                            if is_prewarming:
+                                queue_size = self.audio_in_queue.qsize()
+                                logger.info(f"Turn complete during pre-warming - preserving {queue_size} audio frames for call connection")
+                            else:
+                                logger.info("Turn complete - clearing audio queue")
+                                # Track interruption (turn_complete indicates user interrupted AI)
+                                self.interruption_count += 1
+
+                                # Clear the audio queue on turn complete
+                                while not self.audio_in_queue.empty():
+                                    try:
+                                        self.audio_in_queue.get_nowait()
+                                    except asyncio.QueueEmpty:
+                                        break
 
         except asyncio.CancelledError:
-            logger.info(f"receive_audio task cancelled after {chunk_count} chunks and {turn_count} turns")
+            logger.info(f"receive_audio task completed: {turn_count} turns processed")
         except Exception as exc:
-            logger.error(f"Error in receive_audio after {chunk_count} chunks and {turn_count} turns: %s", exc)
+            logger.error(f"Error in receive_audio: %s", exc)
             import traceback
             traceback.print_exc()
 
@@ -331,9 +558,10 @@ class AudioBridgeManager:
         call_id: str,
         greeting: str = "",
         system_prompt: Optional[str] = None,
+        vad_config: Optional[dict] = None,
     ) -> AudioBridgeSession:
         session = AudioBridgeSession(session_id, call_id)
-        await session.start(greeting, system_prompt)
+        await session.start(greeting, system_prompt, vad_config)
         self.sessions[session_id] = session
         return session
 
@@ -342,10 +570,11 @@ class AudioBridgeManager:
         workflow_id: str,
         greeting: str = "",
         system_prompt: Optional[str] = None,
+        vad_config: Optional[dict] = None,
     ) -> None:
         try:
             session = AudioBridgeSession(f"prewarm-{workflow_id}", workflow_id)
-            await session.start(greeting, system_prompt)
+            await session.start(greeting, system_prompt, vad_config)
             self.prewarmed_sessions[workflow_id] = session
 
             asyncio.create_task(self._cleanup_prewarmed_session(workflow_id, 60))
@@ -359,15 +588,24 @@ class AudioBridgeManager:
         call_id: str,
         greeting: str = "",
         system_prompt: Optional[str] = None,
+        vad_config: Optional[dict] = None,
     ) -> AudioBridgeSession:
         if workflow_id in self.prewarmed_sessions:
             session = self.prewarmed_sessions.pop(workflow_id)
+
+            # Log the state of the pre-warmed session
+            queue_size = session.audio_in_queue.qsize()
+            logger.info(
+                f"Reusing pre-warmed session for workflow {workflow_id}: "
+                f"audio_queue_size={queue_size}, frames_received={session.total_frames_received}"
+            )
+
             session.session_id = session_id
             session.call_id = call_id
             self.sessions[session_id] = session
             return session
 
-        return await self.create_session(session_id, call_id, greeting, system_prompt)
+        return await self.create_session(session_id, call_id, greeting, system_prompt, vad_config)
 
     async def _cleanup_prewarmed_session(self, workflow_id: str, timeout: int):
         await asyncio.sleep(timeout)

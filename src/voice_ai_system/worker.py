@@ -10,6 +10,7 @@ from temporalio.worker import Worker
 
 from src.voice_ai_system.activities import (
     database_activities,
+    metrics_activities,
     session_activities,
     twilio_activities,
 )
@@ -65,6 +66,11 @@ async def run_worker():
         database_activities.save_call_event,
         database_activities.get_call_transcripts,
         database_activities.get_call_by_workflow_id,
+        # Metrics activities
+        metrics_activities.create_or_update_call_metrics,
+        metrics_activities.update_websocket_connection_time,
+        metrics_activities.update_streaming_metrics,
+        metrics_activities.get_call_metrics,
     ]
 
     # Create worker
