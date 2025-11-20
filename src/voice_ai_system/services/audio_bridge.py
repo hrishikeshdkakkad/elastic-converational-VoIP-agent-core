@@ -27,7 +27,7 @@ RECEIVE_SAMPLE_RATE = 24000
 # Use the correct model for Live API with audio
 # Note: gemini-2.0-flash-live-001 is from cookbook, but docs show gemini-2.5-flash-native-audio-preview
 # Let's use 2.0 as it's confirmed working in Google's cookbook
-MODEL = "models/gemini-2.0-flash-live-001"
+MODEL = "models/gemini-2.5-flash-native-audio-preview-09-2025"
 
 
 class AudioBridgeSession:
@@ -40,7 +40,7 @@ class AudioBridgeSession:
         self.session_task = None
         self.client = genai.Client(
             api_key=settings.gemini_api_key,
-            http_options={"api_version": "v1beta"}
+            http_options={"api_version": "v1alpha"}
         )
 
         # Queues for audio streaming
@@ -74,8 +74,6 @@ class AudioBridgeSession:
         """Run the Gemini Live API session with proper async context management."""
         # Build system instruction
         system_text = self._system_prompt or "You are a helpful voice assistant. Be concise and natural."
-        if self._greeting:
-            system_text = f"{system_text}\n\nWhen the conversation starts, greet the user by saying: {self._greeting}"
 
         # Use simple dict config like Google's example
         config = {
@@ -87,7 +85,7 @@ class AudioBridgeSession:
                 "speech_config": {
                     "voice_config": {
                         "prebuilt_voice_config": {
-                            "voice_name": "Aoede"
+                            "voice_name": "Charon"
                         }
                     }
                 }

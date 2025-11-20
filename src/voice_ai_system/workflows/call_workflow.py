@@ -127,29 +127,96 @@ class VoiceCallWorkflow:
             self.call_sid = result["call_sid"]
             workflow.logger.info(f"Twilio call initiated: {self.call_sid}")
 
-            # Step 4: Wait for call to connect or timeout
-            # Consider call connected if EITHER:
-            # 1. Twilio status reaches IN_PROGRESS (status callback)
-            # 2. WebSocket streaming starts (streaming_started signal)
-            # DO NOT include call_ended in wait condition - that causes race conditions!
+            # Step 4: Wait for call to connect with iterative verification
+            # Uses multiple shorter timeouts with Twilio API verification to avoid race conditions
+            # where status callbacks/WebSocket signals arrive just after timeout
             workflow.logger.info(f"Waiting for call to connect... status: {self.status}, streaming: {self.streaming_active}, call_ended: {self.call_ended}")
 
-            # Wait ONLY for positive confirmation of connection
-            # Don't wake on call_ended - that's a race condition!
-            connected = await workflow.wait_condition(
-                lambda: self.status == CallStatus.IN_PROGRESS or self.streaming_active,
-                timeout=timedelta(seconds=30),
-            )
+            call_actually_connected = False
+            max_attempts = 3
+            timeout_per_attempt = 12  # Total: 3 * 12 = 36 seconds
 
-            workflow.logger.info(f"Wait condition returned: connected={connected}, status={self.status}, streaming={self.streaming_active}, call_ended={self.call_ended}")
+            for attempt in range(max_attempts):
+                workflow.logger.info(f"🔍 Connection check attempt {attempt + 1}/{max_attempts}")
 
-            # Check if call actually connected (either via status or streaming)
-            call_actually_connected = self.status == CallStatus.IN_PROGRESS or self.streaming_active
+                # Wait for either success or failure condition
+                connected = await workflow.wait_condition(
+                    lambda: (
+                        self.status == CallStatus.IN_PROGRESS
+                        or self.streaming_active
+                        or self.call_ended
+                    ),
+                    timeout=timedelta(seconds=timeout_per_attempt),
+                )
 
+                workflow.logger.info(
+                    f"Wait attempt {attempt + 1} result: connected={connected}, "
+                    f"status={self.status}, streaming={self.streaming_active}, "
+                    f"call_ended={self.call_ended}"
+                )
+
+                # Check for definite failure (call explicitly ended)
+                if self.call_ended:
+                    workflow.logger.warning(f"❌ Call ended before connection (status: {self.status})")
+                    break
+
+                # Check for success via signals
+                if self.status == CallStatus.IN_PROGRESS or self.streaming_active:
+                    workflow.logger.info(f"✅ Call connected via signal (attempt {attempt + 1})")
+                    call_actually_connected = True
+                    break
+
+                # Timeout occurred - verify with Twilio API before giving up
+                if self.call_sid and attempt < max_attempts - 1:
+                    workflow.logger.info(f"⏱️ Timeout on attempt {attempt + 1} - verifying with Twilio API...")
+
+                    try:
+                        call_state = await workflow.execute_activity(
+                            "get_twilio_call_status",
+                            args=[self.call_sid],
+                            start_to_close_timeout=timedelta(seconds=5),
+                        )
+
+                        api_status = call_state.get("status", "unknown")
+                        workflow.logger.info(f"📞 Twilio API reports status: {api_status}")
+
+                        # Check if call is in active states (still has a chance to connect)
+                        if api_status in ["ringing", "queued"]:
+                            workflow.logger.info(f"Call still {api_status}, continuing to wait (attempt {attempt + 1})")
+                            continue  # Keep waiting
+
+                        elif api_status == "in-progress":
+                            # API says connected but signal hasn't arrived yet - trust the API
+                            workflow.logger.info("✅ Call connected per Twilio API (signal not yet received)")
+                            self.status = CallStatus.IN_PROGRESS
+                            call_actually_connected = True
+                            break
+
+                        elif api_status in ["completed", "busy", "no-answer", "failed", "canceled"]:
+                            # Call has definitely failed
+                            workflow.logger.warning(f"❌ Call failed per Twilio API: {api_status}")
+                            self.call_ended = True
+                            break
+
+                        else:
+                            # Unknown status - keep trying
+                            workflow.logger.warning(f"⚠️ Unknown Twilio status '{api_status}', continuing...")
+                            continue
+
+                    except Exception as e:
+                        workflow.logger.error(f"Failed to verify call status with Twilio API: {e}")
+                        # On API error, continue with remaining attempts
+                        continue
+
+            # Final determination
             if not call_actually_connected:
-                # Call never connected - timeout or genuine failure
-                workflow.logger.warning(f"Call failed to connect - status={self.status}, streaming={self.streaming_active}, call_ended={self.call_ended}")
-                self.status = CallStatus.NO_ANSWER
+                # Call never connected after all attempts
+                workflow.logger.warning(
+                    f"❌ Call failed to connect after {max_attempts} attempts "
+                    f"(status={self.status}, streaming={self.streaming_active}, ended={self.call_ended})"
+                )
+                if self.status == CallStatus.INITIATED or self.status == CallStatus.RINGING:
+                    self.status = CallStatus.NO_ANSWER
                 await self._cleanup_call()
                 return self._build_result()
 
@@ -263,6 +330,14 @@ class VoiceCallWorkflow:
     @workflow.signal
     async def streaming_ended(self, data: dict) -> None:
         """Signal: Media streaming ended (once per call)."""
+        # Idempotent - check if already ended to avoid duplicate processing
+        if self.call_ended:
+            workflow.logger.debug(
+                f"streaming_ended signal received but call already ended "
+                f"(duplicate signal ignored for stream_sid: {data.get('stream_sid')})"
+            )
+            return
+
         self.streaming_active = False
         self.call_ended = True
         workflow.logger.info(f"Streaming ended: {self.stream_sid}")
@@ -305,10 +380,13 @@ class VoiceCallWorkflow:
         else:
             workflow.logger.warning(f"Unknown Twilio status: {status}")
 
-        # Handle call termination states
+        # Handle call termination states (idempotent)
         if status in ["completed", "busy", "no-answer", "failed", "canceled"]:
-            workflow.logger.info(f"🔴 Setting call_ended=True due to terminal status: {status}")
-            self.call_ended = True
+            if not self.call_ended:
+                workflow.logger.info(f"🔴 Setting call_ended=True due to terminal status: {status}")
+                self.call_ended = True
+            else:
+                workflow.logger.debug(f"Terminal status '{status}' received but call already ended (duplicate ignored)")
 
     @workflow.signal
     async def set_call_sid(self, call_sid: str) -> None:

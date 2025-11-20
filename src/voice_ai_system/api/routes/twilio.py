@@ -42,6 +42,7 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
     stream_sid = None
     audio_session = None
     transcript_task = None
+    streaming_ended_sent = False  # Track if we've signaled streaming_ended
 
     try:
         while True:
@@ -108,10 +109,14 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
                 logger.info(f"Media stream stopped: {stream_sid}")
 
                 # Signal Temporal that streaming has ended (coarse event)
-                await handle.signal(
-                    VoiceCallWorkflow.streaming_ended,
-                    {"stream_sid": stream_sid}
-                )
+                # Guard: only send if we have a stream_sid and haven't sent already
+                if stream_sid and not streaming_ended_sent:
+                    await handle.signal(
+                        VoiceCallWorkflow.streaming_ended,
+                        {"stream_sid": stream_sid}
+                    )
+                    streaming_ended_sent = True
+                    logger.info(f"Sent streaming_ended signal for {stream_sid}")
                 break
 
     except WebSocketDisconnect:
@@ -135,14 +140,17 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
             # Close audio bridge session
             await audio_bridge_manager.close_session(stream_sid)
 
-        # Ensure workflow knows streaming ended
-        try:
-            await handle.signal(
-                VoiceCallWorkflow.streaming_ended,
-                {"stream_sid": stream_sid}
-            )
-        except:
-            pass
+        # Signal streaming ended ONLY if not already sent
+        # This prevents duplicate signals when "stop" event was received
+        if stream_sid and not streaming_ended_sent:
+            try:
+                await handle.signal(
+                    VoiceCallWorkflow.streaming_ended,
+                    {"stream_sid": stream_sid}
+                )
+                logger.info(f"Sent streaming_ended signal for {stream_sid} (cleanup path)")
+            except Exception as e:
+                logger.warning(f"Failed to signal streaming_ended in cleanup: {e}")
 
 
 async def _sync_transcripts_to_workflow(audio_session, workflow_handle):
