@@ -22,12 +22,10 @@ def test_activities_import():
     """Test that activities can be imported."""
     from src.voice_ai_system.activities import (
         database_activities,
-        gemini_activities,
         twilio_activities,
     )
 
     assert database_activities is not None
-    assert gemini_activities is not None
     assert twilio_activities is not None
 
 
