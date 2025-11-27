@@ -6,10 +6,7 @@ only using Temporal for coarse-grained events and orchestration.
 """
 
 import asyncio
-import json
-import logging
 from datetime import datetime
-from typing import Any, Dict
 
 import structlog
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
@@ -31,6 +28,7 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
     - Audio flows directly between Twilio and Gemini via audio_bridge
     - Temporal only receives periodic transcript updates (not every frame)
     - Dramatically reduces Temporal activity load
+    - All background tasks are tracked and properly cleaned up
     """
     await websocket.accept()
 
@@ -45,10 +43,18 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
     # Session state
     stream_sid = None
     audio_session = None
-    playback_task = None
-    transcript_task = None
-    metrics_task = None
     streaming_ended_sent = False  # Track if we've signaled streaming_ended
+
+    # Track ALL background tasks for proper cleanup
+    background_tasks: set[asyncio.Task] = set()
+
+    def _create_tracked_task(coro, name: str = None) -> asyncio.Task:
+        """Create a task and track it for cleanup."""
+        task = asyncio.create_task(coro, name=name)
+        background_tasks.add(task)
+        # Auto-remove from set when task completes
+        task.add_done_callback(background_tasks.discard)
+        return task
 
     try:
         while True:
@@ -72,24 +78,29 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
                 # Get call configuration from workflow (one-time query)
                 call_config = await handle.query(VoiceCallWorkflow.get_call_config)
 
-                # Track WebSocket metrics via Temporal activity
-                asyncio.create_task(_update_websocket_metrics(
-                    temporal_client,
-                    workflow_id,
-                    call_config.get("call_id"),
-                    websocket_connected_at,
-                    streaming_started_at,
-                    call_sid,
-                    stream_sid
-                ))
+                # Track WebSocket metrics via Temporal activity (tracked task)
+                _create_tracked_task(
+                    _update_websocket_metrics(
+                        temporal_client,
+                        workflow_id,
+                        call_config.get("call_id"),
+                        websocket_connected_at,
+                        streaming_started_at,
+                        call_sid,
+                        stream_sid
+                    ),
+                    name=f"metrics-update-{stream_sid}"
+                )
 
                 # Default VAD configuration optimized for phone calls
+                # Note: silence_duration_ms controls how long silence triggers end-of-speech
+                # Too short (100ms) = cuts off mid-sentence; too long (1000ms+) = slow response
                 vad_config = {
                     "disabled": False,  # VAD must be enabled for Gemini to detect when to speak
-                    "start_sensitivity": "LOW",  # Less sensitive to avoid false starts
-                    "end_sensitivity": "LOW",  # Allow natural pauses
-                    "prefix_padding_ms": 100,  # Quick response but avoid false positives
-                    "silence_duration_ms": 100  # Allow natural pauses in conversation
+                    "start_sensitivity": "HIGH",  # More sensitive to detect speech start quickly
+                    "end_sensitivity": "LOW",  # Less sensitive to avoid cutting off mid-sentence
+                    "prefix_padding_ms": 200,  # Buffer before speech detection
+                    "silence_duration_ms": 500  # 500ms silence = end of speech (reasonable pause)
                 }
 
                 # Override with call-specific VAD config if provided
@@ -107,22 +118,28 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
                 )
 
                 # Start dedicated playback task (20ms cadence, independent of inbound frames)
-                playback_task = asyncio.create_task(
-                    _playback_task(audio_session, websocket, stream_sid)
+                _create_tracked_task(
+                    _playback_task(audio_session, websocket, stream_sid),
+                    name=f"playback-{stream_sid}"
                 )
 
                 # CRITICAL: Immediately flush any pre-warmed audio to avoid silence
                 # Pre-warming generates audio before call connects - send it now!
-                asyncio.create_task(_flush_prewarmed_audio(audio_session, websocket, stream_sid))
+                _create_tracked_task(
+                    _flush_prewarmed_audio(audio_session, websocket, stream_sid),
+                    name=f"flush-prewarm-{stream_sid}"
+                )
 
                 # Start periodic transcript sync task
-                transcript_task = asyncio.create_task(
-                    _sync_transcripts_to_workflow(audio_session, handle)
+                _create_tracked_task(
+                    _sync_transcripts_to_workflow(audio_session, handle),
+                    name=f"transcript-sync-{stream_sid}"
                 )
 
                 # Start periodic metrics sync task
-                metrics_task = asyncio.create_task(
-                    _sync_metrics_to_workflow(audio_session, handle, workflow_id)
+                _create_tracked_task(
+                    _sync_metrics_to_workflow(audio_session, handle, workflow_id),
+                    name=f"metrics-sync-{stream_sid}"
                 )
 
                 # Signal Temporal that streaming has started (coarse event)
@@ -138,8 +155,11 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
                     audio_base64 = media_data["payload"]
 
                     # Send to audio bridge (bypasses Temporal)
-                    # Use create_task to avoid blocking the WebSocket event loop
-                    asyncio.create_task(audio_session.send_audio_from_twilio(audio_base64))
+                    # Use tracked task to avoid blocking the WebSocket event loop
+                    _create_tracked_task(
+                        audio_session.send_audio_from_twilio(audio_base64),
+                        name=f"audio-send-{stream_sid}"
+                    )
 
                     # NOTE: Outbound audio is now handled by dedicated playback_task
                     # We no longer poll for audio here to avoid gating responses on inbound frames
@@ -164,24 +184,31 @@ async def media_stream_handler(websocket: WebSocket, workflow_id: str):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        # Cleanup
-        if playback_task:
-            playback_task.cancel()
+        # Cancel ALL tracked background tasks
+        if background_tasks:
+            logger.info(f"Cancelling {len(background_tasks)} background tasks for {workflow_id}")
+            for task in background_tasks:
+                if not task.done():
+                    task.cancel()
 
-        if transcript_task:
-            transcript_task.cancel()
-
-        if metrics_task:
-            metrics_task.cancel()
+            # Wait for all tasks to complete cancellation (with timeout)
+            if background_tasks:
+                try:
+                    await asyncio.wait(background_tasks, timeout=2.0)
+                except Exception as e:
+                    logger.warning(f"Error waiting for task cancellation: {e}")
 
         if audio_session:
             # Send final transcripts to workflow
-            final_transcripts = await audio_session.get_transcript_buffer()
-            if final_transcripts:
-                await handle.signal(
-                    VoiceCallWorkflow.transcripts_available,
-                    [t.model_dump() for t in final_transcripts]
-                )
+            try:
+                final_transcripts = await audio_session.get_transcript_buffer()
+                if final_transcripts:
+                    await handle.signal(
+                        VoiceCallWorkflow.transcripts_available,
+                        [t.model_dump() for t in final_transcripts]
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to send final transcripts: {e}")
 
             # Close audio bridge session
             await audio_bridge_manager.close_session(stream_sid)

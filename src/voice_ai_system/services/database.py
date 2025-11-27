@@ -6,6 +6,8 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import logging
+
 from pydantic import PostgresDsn
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -14,6 +16,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import declarative_base
+
+from src.voice_ai_system.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Base for SQLAlchemy models (used by Alembic as well)
 Base = declarative_base()
@@ -58,8 +64,14 @@ async def init_engine(database_url: str | PostgresDsn | None = None) -> AsyncEng
         url,
         echo=False,
         pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+    )
+
+    logger.info(
+        f"Database engine initialized: pool_size={settings.db_pool_size}, "
+        f"max_overflow={settings.db_max_overflow}, pool_timeout={settings.db_pool_timeout}"
     )
     _sessionmaker = async_sessionmaker(
         _engine,

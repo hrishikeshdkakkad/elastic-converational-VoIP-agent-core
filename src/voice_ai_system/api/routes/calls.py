@@ -56,11 +56,14 @@ async def initiate_call(request: Request, call_request: InitiateCallRequest):
 
     This endpoint starts a Temporal workflow that orchestrates the entire call lifecycle.
     """
+    from src.voice_ai_system.services.audio_bridge import audio_bridge_manager
+
     temporal_client = request.app.state.temporal_client
     settings = request.app.state.settings
 
     # Generate workflow ID
     workflow_id = f"call-{uuid4()}"
+    prewarm_started = False
 
     logger.info(
         "Initiating call",
@@ -77,6 +80,24 @@ async def initiate_call(request: Request, call_request: InitiateCallRequest):
             max_duration_seconds=call_request.max_duration_seconds,
         )
 
+        # Pre-warm Gemini session BEFORE starting workflow
+        # This way if workflow fails, we can clean up the pre-warmed session
+        # Pre-warming is fire-and-forget but tracked for cleanup
+        asyncio.create_task(
+            audio_bridge_manager.prewarm_session(
+                workflow_id=workflow_id,
+                greeting=call_request.greeting,
+                system_prompt=call_request.system_prompt
+            )
+        )
+        prewarm_started = True
+
+        logger.info(
+            "Gemini pre-warming initiated",
+            workflow_id=workflow_id,
+            optimization="pre-warming enabled"
+        )
+
         # Start workflow
         handle: WorkflowHandle = await temporal_client.start_workflow(
             VoiceCallWorkflow.run,
@@ -91,23 +112,6 @@ async def initiate_call(request: Request, call_request: InitiateCallRequest):
             run_id=handle.first_execution_run_id,
         )
 
-        # Pre-warm Gemini session during ring time (non-blocking optimization)
-        # This reduces latency from ~3s to ~0.7s when user answers
-        from src.voice_ai_system.services.audio_bridge import audio_bridge_manager
-        asyncio.create_task(
-            audio_bridge_manager.prewarm_session(
-                workflow_id=workflow_id,
-                greeting=call_request.greeting,
-                system_prompt=call_request.system_prompt
-            )
-        )
-
-        logger.info(
-            "Gemini pre-warming initiated",
-            workflow_id=workflow_id,
-            optimization="pre-warming enabled"
-        )
-
         return CallResponse(
             workflow_id=workflow_id,
             run_id=handle.first_execution_run_id,
@@ -117,6 +121,23 @@ async def initiate_call(request: Request, call_request: InitiateCallRequest):
 
     except Exception as e:
         logger.error("Failed to start call workflow", error=str(e), exc_info=True)
+
+        # CRITICAL: Clean up pre-warmed session if workflow failed to start
+        if prewarm_started:
+            try:
+                cleaned = await audio_bridge_manager.cleanup_prewarm(workflow_id)
+                if cleaned:
+                    logger.info(
+                        "Cleaned up orphaned pre-warmed session",
+                        workflow_id=workflow_id
+                    )
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Failed to cleanup pre-warmed session",
+                    workflow_id=workflow_id,
+                    error=str(cleanup_error)
+                )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to initiate call: {str(e)}",

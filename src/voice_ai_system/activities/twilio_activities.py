@@ -1,8 +1,9 @@
 """Temporal activities for Twilio interactions."""
 
-from typing import Any
+from typing import Any, Optional
 import asyncio
 import logging
+import threading
 
 from temporalio import activity
 from twilio.rest import Client
@@ -12,6 +13,40 @@ from src.voice_ai_system.config import settings
 # Enable Twilio SDK debug logging
 logging.basicConfig()
 logging.getLogger('twilio').setLevel(logging.DEBUG)
+
+logger = logging.getLogger(__name__)
+
+
+# Singleton Twilio client for connection reuse
+# Thread-safe initialization using a lock
+_twilio_client: Optional[Client] = None
+_twilio_client_lock = threading.Lock()
+
+
+def get_twilio_client() -> Client:
+    """Get or create a singleton Twilio client.
+
+    The Twilio Client uses HTTP connection pooling internally,
+    so reusing the same client improves performance and reduces
+    connection overhead.
+
+    Thread-safe implementation for use across multiple activities.
+    """
+    global _twilio_client
+
+    if _twilio_client is not None:
+        return _twilio_client
+
+    with _twilio_client_lock:
+        # Double-check after acquiring lock
+        if _twilio_client is None:
+            logger.info("Creating singleton Twilio client")
+            _twilio_client = Client(
+                settings.twilio_account_sid,
+                settings.twilio_auth_token
+            )
+
+    return _twilio_client
 
 
 @activity.defn(name="initiate_twilio_call")
@@ -33,11 +68,8 @@ async def initiate_twilio_call(params: dict[str, Any]) -> dict[str, Any]:
         extra={"call_id": params["call_id"]},
     )
 
-    # Create Twilio client (sync)
-    client = Client(
-        settings.twilio_account_sid,
-        settings.twilio_auth_token
-    )
+    # Get singleton Twilio client (reuses connections)
+    client = get_twilio_client()
 
     # Build callback URLs and WebSocket URL
     base_url = settings.base_url
@@ -67,20 +99,19 @@ async def initiate_twilio_call(params: dict[str, Any]) -> dict[str, Any]:
     </Connect>
 </Response>"""
 
-    activity.logger.info(f"📞 Creating Twilio call with inline TwiML and WebSocket: {ws_url}")
-
-    print("=" * 80)
-    print(f"TWILIO CALL - INLINE TWIML SOLUTION")
-    print(f"  to: {params['phone_number']}")
-    print(f"  from: {settings.twilio_phone_number}")
-    print(f"  WebSocket URL: {ws_url}")
-    print(f"  Status callback: {status_callback_url}")
-    print("=" * 80)
+    activity.logger.info(
+        f"Creating Twilio call",
+        extra={
+            "phone_number": params['phone_number'],
+            "from_number": settings.twilio_phone_number,
+            "ws_url": ws_url,
+            "status_callback": status_callback_url,
+        }
+    )
 
     try:
         # Run sync Twilio call in thread pool (Twilio SDK is sync-only for calls)
         def _create_call():
-            print("CREATING CALL WITH INLINE TWIML - WebSocket URL embedded")
             result = client.calls.create(
                 to=params["phone_number"],
                 from_=settings.twilio_phone_number,
@@ -89,8 +120,6 @@ async def initiate_twilio_call(params: dict[str, Any]) -> dict[str, Any]:
                 status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
                 status_callback_method='POST'
             )
-            print(f"✅ Call created! SID: {result.sid}, Status: {result.status}")
-            print(f"   WebSocket should connect when call is answered")
             return result
 
         call = await asyncio.to_thread(_create_call)
@@ -123,11 +152,8 @@ async def terminate_twilio_call(call_sid: str) -> dict[str, Any]:
     """
     activity.logger.info(f"Terminating Twilio call {call_sid}")
 
-    # Create Twilio client (sync)
-    client = Client(
-        settings.twilio_account_sid,
-        settings.twilio_auth_token
-    )
+    # Get singleton Twilio client (reuses connections)
+    client = get_twilio_client()
 
     try:
         # Run sync Twilio update in thread pool
@@ -163,11 +189,8 @@ async def get_twilio_call_status(call_sid: str) -> dict[str, Any]:
     """
     activity.logger.info(f"Getting status for Twilio call {call_sid}")
 
-    # Create Twilio client (sync)
-    client = Client(
-        settings.twilio_account_sid,
-        settings.twilio_auth_token
-    )
+    # Get singleton Twilio client (reuses connections)
+    client = get_twilio_client()
 
     try:
         # Run sync Twilio fetch in thread pool

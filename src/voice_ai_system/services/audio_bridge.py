@@ -60,13 +60,15 @@ class AudioBridgeSession:
             thread_name_prefix=f"audio-{session_id[:8]}"
         )
 
-        # VAD configuration (with defaults)
+        # VAD configuration (with defaults optimized for phone calls)
+        # IMPORTANT: Pre-warmed sessions use these defaults and VAD can't be changed mid-session
+        # So these defaults should match what twilio.py expects
         self._vad_config = {
             "disabled": False,
-            "start_sensitivity": "LOW",  # Will be converted to enum
-            "end_sensitivity": "LOW",    # Will be converted to enum
-            "prefix_padding_ms": 100,
-            "silence_duration_ms": 700
+            "start_sensitivity": "HIGH",  # More sensitive to detect speech start quickly
+            "end_sensitivity": "LOW",     # Less sensitive to avoid cutting off mid-sentence
+            "prefix_padding_ms": 200,     # Buffer before speech detection
+            "silence_duration_ms": 500    # 500ms silence = end of speech
         }
 
         # Monitoring counters for backpressure detection
@@ -91,6 +93,10 @@ class AudioBridgeSession:
 
         # Track user and AI transcripts separately for turn counting
         self._last_speaker: Optional[Speaker] = None
+
+        # Heartbeat tracking for stuck detection
+        self._last_receive_activity: Optional[datetime] = None
+        self._current_turn: int = 0
 
     async def start(self, greeting: str = "", system_prompt: Optional[str] = None, vad_config: Optional[dict] = None):
         """Connect to Gemini Live API and start processing loops.
@@ -124,9 +130,14 @@ class AudioBridgeSession:
 
     async def _run_session(self):
         """Run the Gemini Live API session with proper async context management."""
-        # Build system instruction
-        # Note: Greeting is now handled by Twilio's <Say> verb in TwiML for instant response
-        system_text = self._system_prompt or "You are a helpful voice assistant. Be concise and natural."
+        # Build system instruction with language specification
+        # Important: Explicitly specify English to avoid language detection issues on phone audio
+        default_prompt = (
+            "You are a helpful voice assistant on a phone call. "
+            "Always respond in English. Be concise and natural. "
+            "Keep responses brief since this is a phone conversation."
+        )
+        system_text = self._system_prompt or default_prompt
         logger.debug(f"System prompt: {system_text[:100]}...")
 
         # Configure VAD for optimal voice call experience
@@ -179,6 +190,7 @@ class AudioBridgeSession:
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
                     tg.create_task(self._ensure_first_audio_frame())
+                    tg.create_task(self._heartbeat_monitor())
 
         except Exception as exc:
             logger.error(f"Session error: {exc}")
@@ -258,6 +270,22 @@ class AudioBridgeSession:
         try:
             self.total_frames_sent += 1
 
+            # Log audio level periodically to diagnose VAD issues
+            if self.total_frames_sent == 1 or self.total_frames_sent % 200 == 0:
+                import base64
+                import numpy as np
+                try:
+                    raw_mulaw = base64.b64decode(audio_data)
+                    # Check μ-law data characteristics
+                    mulaw_arr = np.frombuffer(raw_mulaw, dtype=np.uint8)
+                    mulaw_min, mulaw_max, mulaw_mean = mulaw_arr.min(), mulaw_arr.max(), mulaw_arr.mean()
+                    logger.info(
+                        f"Audio diagnostics (frame {self.total_frames_sent}): "
+                        f"mulaw bytes={len(raw_mulaw)}, min={mulaw_min}, max={mulaw_max}, mean={mulaw_mean:.1f}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Audio diagnostics error: {e}")
+
             # Early backpressure: check queue depth BEFORE doing expensive processing
             queue_depth = self.out_queue.qsize()
             queue_utilization = queue_depth / self.out_queue.maxsize
@@ -283,6 +311,23 @@ class AudioBridgeSession:
                 twilio_to_gemini,
                 audio_data
             )
+
+            # Log PCM audio levels periodically to verify conversion
+            if self.total_frames_sent == 1 or self.total_frames_sent % 200 == 0:
+                import numpy as np
+                try:
+                    pcm_arr = np.frombuffer(pcm_audio, dtype=np.int16)
+                    pcm_min, pcm_max = pcm_arr.min(), pcm_arr.max()
+                    pcm_rms = np.sqrt(np.mean(pcm_arr.astype(np.float32) ** 2))
+                    # Calculate dB relative to full scale (dBFS)
+                    dbfs = 20 * np.log10(pcm_rms / 32768.0) if pcm_rms > 0 else -100
+                    logger.info(
+                        f"PCM diagnostics (frame {self.total_frames_sent}): "
+                        f"samples={len(pcm_arr)}, min={pcm_min}, max={pcm_max}, "
+                        f"RMS={pcm_rms:.1f}, dBFS={dbfs:.1f}"
+                    )
+                except Exception as e:
+                    logger.warning(f"PCM diagnostics error: {e}")
 
             if self.total_frames_sent % 50 == 0:
                 logger.info(
@@ -374,14 +419,26 @@ class AudioBridgeSession:
         """
         logger.info("Starting send_realtime task for session %s", self.session_id)
         chunk_count = 0
+        total_bytes_sent = 0
+        last_log_time = datetime.utcnow()
         try:
             while self.active:
                 audio_blob = await self.out_queue.get()
                 await self.session.send_realtime_input(audio=audio_blob)
                 chunk_count += 1
+                total_bytes_sent += len(audio_blob.data) if hasattr(audio_blob, 'data') else 0
+
+                # Log every 100 chunks or every 5 seconds
+                now = datetime.utcnow()
+                if chunk_count % 100 == 0 or (now - last_log_time).total_seconds() > 5:
+                    logger.info(
+                        f"Audio send progress: {chunk_count} chunks, {total_bytes_sent} bytes sent to Gemini "
+                        f"(session={self.session_id})"
+                    )
+                    last_log_time = now
 
         except asyncio.CancelledError:
-            logger.info(f"send_realtime task completed: {chunk_count} chunks sent")
+            logger.info(f"send_realtime task completed: {chunk_count} chunks, {total_bytes_sent} bytes sent")
         except Exception as exc:
             logger.error(f"Error in send_realtime after {chunk_count} chunks: %s", exc)
             import traceback
@@ -405,14 +462,88 @@ class AudioBridgeSession:
         logger.info("Starting receive_audio task for session %s", self.session_id)
         chunk_count = 0
         turn_count = 0
+        last_activity_time = datetime.utcnow()
         try:
             while self.active:
-                turn = self.session.receive()
-                turn_count += 1
-
-                async for response in turn:
+                # CRITICAL: During pre-warming, only process Turn 1 (the greeting).
+                # Don't start Turn 2 until the session is connected to a real call.
+                # This prevents the VAD from getting stuck waiting on silence.
+                is_prewarming = self.session_id.startswith("prewarm-")
+                if is_prewarming and turn_count >= 1:
+                    logger.info(f"Pre-warming complete after turn {turn_count}, waiting for call to connect...")
+                    # Wait until session_id changes (indicating session was claimed by a real call)
+                    while self.active and self.session_id.startswith("prewarm-"):
+                        await asyncio.sleep(0.1)
                     if not self.active:
                         break
+                    logger.info(f"Session claimed by real call, resuming with session_id={self.session_id}")
+
+                logger.info(f"Waiting for turn {turn_count + 1} from Gemini (session={self.session_id})")
+                turn = self.session.receive()
+                turn_count += 1
+                self._current_turn = turn_count
+                last_activity_time = datetime.utcnow()
+                self._last_receive_activity = last_activity_time
+                logger.info(f"Started receiving turn {turn_count} (session={self.session_id})")
+
+                async for response in turn:
+                    last_activity_time = datetime.utcnow()
+                    self._last_receive_activity = last_activity_time
+                    if not self.active:
+                        break
+
+                    # DEBUG: Log ALL response attributes to understand what Gemini sends
+                    response_attrs = []
+                    if hasattr(response, 'data') and response.data:
+                        response_attrs.append(f"data({len(response.data)})")
+                    if hasattr(response, 'text') and response.text:
+                        response_attrs.append(f"text({len(response.text)})")
+                    if hasattr(response, 'server_content') and response.server_content:
+                        sc = response.server_content
+                        sc_info = []
+                        if getattr(sc, 'turn_complete', False):
+                            sc_info.append("turn_complete")
+                        if getattr(sc, 'interrupted', False):
+                            sc_info.append("interrupted")
+                        if getattr(sc, 'generation_complete', False):
+                            sc_info.append("generation_complete")
+                        if getattr(sc, 'grounding_metadata', None):
+                            sc_info.append("grounding_metadata")
+                        if sc_info:
+                            response_attrs.append(f"server_content({','.join(sc_info)})")
+                    if hasattr(response, 'input_transcription') and response.input_transcription:
+                        it = response.input_transcription
+                        it_text = getattr(it, 'text', '')
+                        response_attrs.append(f"input_transcription({len(it_text)} chars)")
+                    if hasattr(response, 'output_transcription') and response.output_transcription:
+                        ot = response.output_transcription
+                        ot_text = getattr(ot, 'text', '')
+                        response_attrs.append(f"output_transcription({len(ot_text)} chars)")
+                    if hasattr(response, 'tool_call') and response.tool_call:
+                        response_attrs.append("tool_call")
+                    if hasattr(response, 'tool_call_cancellation') and response.tool_call_cancellation:
+                        response_attrs.append("tool_call_cancellation")
+                    if hasattr(response, 'setup_complete') and response.setup_complete:
+                        response_attrs.append("setup_complete")
+                    if hasattr(response, 'go_away') and response.go_away:
+                        response_attrs.append("go_away")
+                    if hasattr(response, 'session_resumption_update') and response.session_resumption_update:
+                        response_attrs.append("session_resumption_update")
+                    # VAD activity events
+                    if hasattr(response, 'realtime_input') and response.realtime_input:
+                        ri = response.realtime_input
+                        ri_info = []
+                        if hasattr(ri, 'activity_start') and ri.activity_start:
+                            ri_info.append("activity_start")
+                        if hasattr(ri, 'activity_end') and ri.activity_end:
+                            ri_info.append("activity_end")
+                        if ri_info:
+                            response_attrs.append(f"realtime_input({','.join(ri_info)})")
+                            # Also log as INFO since VAD events are important
+                            logger.info(f"VAD: {','.join(ri_info)} detected on turn {turn_count}")
+
+                    if response_attrs:
+                        logger.debug(f"Turn {turn_count} event: {', '.join(response_attrs)}")
 
                     # Handle audio data (like Google's example)
                     if data := response.data:
@@ -498,34 +629,41 @@ class AudioBridgeSession:
                                 )
                             )
 
-                    # CRITICAL: Handle interruptions (from Google's example)
-                    # "If you interrupt the model, it sends a turn_complete.
-                    # For interruptions to work, we need to stop playback.
-                    # So empty out the audio queue because it may have loaded
-                    # much more audio than has played yet."
+                    # Handle turn completion and interruptions
+                    # IMPORTANT: Only clear audio queue on INTERRUPTION, not on normal turn completion
+                    # - interrupted=True → User barged in, clear queued audio
+                    # - turn_complete=True without interrupted → AI finished normally, don't clear
                     if hasattr(response, 'server_content'):
                         server_content = response.server_content
-                        logger.info(f"Got server_content: {server_content}")
-                        if server_content and getattr(server_content, 'turn_complete', False):
-                            # IMPORTANT: Don't clear audio queue during pre-warming!
-                            # Pre-warmed sessions don't have a WebSocket yet, so we need to preserve
-                            # the greeting audio for when the call connects.
-                            is_prewarming = self.session_id.startswith("prewarm-")
+                        if server_content:
+                            is_interrupted = getattr(server_content, 'interrupted', False)
+                            is_turn_complete = getattr(server_content, 'turn_complete', False)
 
-                            if is_prewarming:
-                                queue_size = self.audio_in_queue.qsize()
-                                logger.info(f"Turn complete during pre-warming - preserving {queue_size} audio frames for call connection")
-                            else:
-                                logger.info("Turn complete - clearing audio queue")
-                                # Track interruption (turn_complete indicates user interrupted AI)
+                            if is_interrupted:
+                                # User interrupted the AI - clear audio queue to stop playback
+                                logger.info(f"Turn {turn_count} INTERRUPTED - clearing audio queue")
                                 self.interruption_count += 1
-
-                                # Clear the audio queue on turn complete
                                 while not self.audio_in_queue.empty():
                                     try:
                                         self.audio_in_queue.get_nowait()
                                     except asyncio.QueueEmpty:
                                         break
+                            elif is_turn_complete:
+                                # AI finished speaking normally
+                                is_prewarming = self.session_id.startswith("prewarm-")
+                                if is_prewarming:
+                                    queue_size = self.audio_in_queue.qsize()
+                                    logger.info(f"Turn {turn_count} complete during pre-warming - preserving {queue_size} audio frames")
+                                else:
+                                    logger.info(f"Turn {turn_count} complete - ready for next user input")
+
+                    # Handle go_away - Gemini is ending the session
+                    if hasattr(response, 'go_away') and response.go_away:
+                        logger.warning(f"Gemini sent go_away signal! Session may be ending. Details: {response.go_away}")
+
+                # Log when turn iteration completes
+                logger.info(f"Turn {turn_count} iteration completed, looping to wait for next turn (session={self.session_id})")
+                logger.info(f"Audio stats: sent_to_gemini={self.total_frames_sent}, received_from_gemini={self.total_frames_received}, out_queue={self.out_queue.qsize()}")
 
         except asyncio.CancelledError:
             logger.info(f"receive_audio task completed: {turn_count} turns processed")
@@ -544,13 +682,69 @@ class AudioBridgeSession:
         while self.active:
             await asyncio.sleep(1.0)
 
+    async def _heartbeat_monitor(self):
+        """
+        Monitor for stuck receive loop - logs warning if no activity for extended period.
+        This helps diagnose issues where Gemini stops responding.
+        """
+        HEARTBEAT_INTERVAL = 5  # Check every 5 seconds
+        STUCK_THRESHOLD = 15  # Warn if no activity for 15 seconds (during a turn)
+
+        logger.info(f"Starting heartbeat monitor for session {self.session_id}")
+
+        try:
+            while self.active:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+                if not self.active:
+                    break
+
+                # Log current state every heartbeat
+                queue_in_size = self.audio_in_queue.qsize()
+                queue_out_size = self.out_queue.qsize()
+
+                # Check if receive loop is stuck
+                if self._last_receive_activity:
+                    elapsed = (datetime.utcnow() - self._last_receive_activity).total_seconds()
+
+                    # Only warn if we're mid-turn and stuck
+                    if elapsed > STUCK_THRESHOLD and self._current_turn > 0:
+                        logger.warning(
+                            f"HEARTBEAT: No receive activity for {elapsed:.1f}s! "
+                            f"Turn={self._current_turn}, session={self.session_id}, "
+                            f"in_queue={queue_in_size}, out_queue={queue_out_size}, "
+                            f"frames_sent={self.total_frames_sent}, frames_received={self.total_frames_received}"
+                        )
+                    else:
+                        logger.info(
+                            f"HEARTBEAT: Turn={self._current_turn}, last_activity={elapsed:.1f}s ago, "
+                            f"in_queue={queue_in_size}, out_queue={queue_out_size}, "
+                            f"sent={self.total_frames_sent}, received={self.total_frames_received}"
+                        )
+                else:
+                    logger.info(
+                        f"HEARTBEAT: Waiting for first turn, session={self.session_id}, "
+                        f"in_queue={queue_in_size}, out_queue={queue_out_size}"
+                    )
+
+        except asyncio.CancelledError:
+            logger.info(f"Heartbeat monitor stopped for session {self.session_id}")
+        except Exception as exc:
+            logger.error(f"Error in heartbeat monitor: {exc}")
+
 
 class AudioBridgeManager:
-    """Tracks active bridge sessions and supports pre-warming."""
+    """Tracks active bridge sessions and supports pre-warming with proper cleanup."""
+
+    # Shorter timeout for pre-warmed sessions (30 seconds instead of 60)
+    # Most calls connect within 15 seconds; 30s is generous
+    PREWARM_TIMEOUT_SECONDS = 30
 
     def __init__(self):
         self.sessions: Dict[str, AudioBridgeSession] = {}
         self.prewarmed_sessions: Dict[str, AudioBridgeSession] = {}
+        # Track cleanup tasks so we can cancel them when session is claimed
+        self._prewarm_cleanup_tasks: Dict[str, asyncio.Task] = {}
 
     async def create_session(
         self,
@@ -572,14 +766,44 @@ class AudioBridgeManager:
         system_prompt: Optional[str] = None,
         vad_config: Optional[dict] = None,
     ) -> None:
+        """Pre-warm a Gemini session for reduced latency when call connects.
+
+        The session will be automatically cleaned up after PREWARM_TIMEOUT_SECONDS
+        if not claimed by get_or_create_session().
+        """
         try:
+            # Check if we already have a pre-warmed session for this workflow
+            if workflow_id in self.prewarmed_sessions:
+                logger.warning(
+                    f"Pre-warmed session already exists for workflow {workflow_id}, skipping"
+                )
+                return
+
             session = AudioBridgeSession(f"prewarm-{workflow_id}", workflow_id)
             await session.start(greeting, system_prompt, vad_config)
             self.prewarmed_sessions[workflow_id] = session
 
-            asyncio.create_task(self._cleanup_prewarmed_session(workflow_id, 60))
+            # Create tracked cleanup task
+            cleanup_task = asyncio.create_task(
+                self._cleanup_prewarmed_session(workflow_id, self.PREWARM_TIMEOUT_SECONDS),
+                name=f"prewarm-cleanup-{workflow_id}"
+            )
+            self._prewarm_cleanup_tasks[workflow_id] = cleanup_task
+
+            # Auto-remove from tracking dict when task completes
+            cleanup_task.add_done_callback(
+                lambda t: self._prewarm_cleanup_tasks.pop(workflow_id, None)
+            )
+
+            logger.info(
+                f"Pre-warmed session created for workflow {workflow_id}, "
+                f"will auto-cleanup in {self.PREWARM_TIMEOUT_SECONDS}s if unused"
+            )
+
         except Exception as exc:
             logger.warning("Failed to prewarm session %s: %s", workflow_id, exc)
+            # Ensure cleanup on failure
+            await self.cleanup_prewarm(workflow_id)
 
     async def get_or_create_session(
         self,
@@ -590,8 +814,15 @@ class AudioBridgeManager:
         system_prompt: Optional[str] = None,
         vad_config: Optional[dict] = None,
     ) -> AudioBridgeSession:
+        """Get a pre-warmed session or create a new one."""
         if workflow_id in self.prewarmed_sessions:
             session = self.prewarmed_sessions.pop(workflow_id)
+
+            # Cancel the cleanup task since session is being claimed
+            cleanup_task = self._prewarm_cleanup_tasks.pop(workflow_id, None)
+            if cleanup_task and not cleanup_task.done():
+                cleanup_task.cancel()
+                logger.debug(f"Cancelled cleanup task for claimed session {workflow_id}")
 
             # Log the state of the pre-warmed session
             queue_size = session.audio_in_queue.qsize()
@@ -607,11 +838,40 @@ class AudioBridgeManager:
 
         return await self.create_session(session_id, call_id, greeting, system_prompt, vad_config)
 
-    async def _cleanup_prewarmed_session(self, workflow_id: str, timeout: int):
-        await asyncio.sleep(timeout)
+    async def cleanup_prewarm(self, workflow_id: str) -> bool:
+        """Explicitly cleanup a pre-warmed session (e.g., when workflow fails).
+
+        Returns True if a session was cleaned up, False if none existed.
+        """
+        # Cancel cleanup task if exists
+        cleanup_task = self._prewarm_cleanup_tasks.pop(workflow_id, None)
+        if cleanup_task and not cleanup_task.done():
+            cleanup_task.cancel()
+
+        # Stop and remove session
         session = self.prewarmed_sessions.pop(workflow_id, None)
         if session:
+            logger.info(f"Explicitly cleaning up pre-warmed session for workflow {workflow_id}")
             await session.stop()
+            return True
+        return False
+
+    async def _cleanup_prewarmed_session(self, workflow_id: str, timeout: int):
+        """Auto-cleanup task for pre-warmed sessions that weren't claimed."""
+        try:
+            await asyncio.sleep(timeout)
+            session = self.prewarmed_sessions.pop(workflow_id, None)
+            if session:
+                logger.info(
+                    f"Auto-cleaning pre-warmed session for workflow {workflow_id} "
+                    f"(unclaimed after {timeout}s)"
+                )
+                await session.stop()
+        except asyncio.CancelledError:
+            # Task was cancelled because session was claimed - this is expected
+            pass
+        except Exception as exc:
+            logger.error(f"Error in prewarm cleanup for {workflow_id}: {exc}")
 
     async def get_session(self, session_id: str) -> Optional[AudioBridgeSession]:
         return self.sessions.get(session_id)
@@ -622,8 +882,20 @@ class AudioBridgeManager:
             await session.stop()
 
     async def close_all_sessions(self):
+        """Close all active and pre-warmed sessions."""
+        # Close active sessions
         for session_id in list(self.sessions.keys()):
             await self.close_session(session_id)
+
+        # Cleanup all pre-warmed sessions
+        for workflow_id in list(self.prewarmed_sessions.keys()):
+            await self.cleanup_prewarm(workflow_id)
+
+        # Cancel any remaining cleanup tasks
+        for task in self._prewarm_cleanup_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._prewarm_cleanup_tasks.clear()
 
 
 audio_bridge_manager = AudioBridgeManager()
