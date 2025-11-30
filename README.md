@@ -9,23 +9,27 @@ Production-ready voice AI system using Twilio, Google Gemini Live API, and Tempo
 - **PostgreSQL**: Database for Temporal and application data with Alembic migrations
 - **Redis**: Session state management for horizontal scalability
 - **Twilio**: Telephony and real-time audio streaming
-- **Google Gemini Live API**: Real-time conversational AI with bidirectional audio
+- **Google Gemini Live API**: Real-time conversational AI with bidirectional audio (gemini-2.0-flash-live-001)
 - **Docker Compose**: Local development and deployment
+- **Terraform**: Production AWS infrastructure (ECS Fargate, RDS, ElastiCache)
 
 ## Features
 
-✅ **Durable phone call orchestration** with Temporal workflows
-✅ **Real-time audio streaming** via WebSocket (Twilio Media Streams)
-✅ **AI-powered conversations** with Google Gemini Live (2.5 Flash Native Audio)
-✅ **Optimized latency** with Gemini session pre-warming (~77% faster first response)
-✅ **Audio bridge architecture** - streaming outside Temporal's hot path
-✅ **Audio format conversion** (μ-law ↔ PCM) with SOXR resampling
-✅ **Call transcripts** and metadata storage with PostgreSQL
-✅ **Fault-tolerant execution** with automatic retries
-✅ **Session state management** with Redis for horizontal scaling
-✅ **Database migrations** with Alembic
-✅ **Monitoring** with Temporal UI, Prometheus, and Grafana
-✅ **Production-ready** with connection pooling and resource management
+- **Durable phone call orchestration** with Temporal workflows
+- **Real-time audio streaming** via WebSocket (Twilio Media Streams)
+- **AI-powered conversations** with Google Gemini Live (2.0 Flash Native Audio)
+- **Optimized latency** with Gemini session pre-warming (~77% faster first response)
+- **Audio bridge architecture** - streaming outside Temporal's hot path
+- **Audio format conversion** (u-law 8kHz to PCM 16kHz/24kHz) with SOXR resampling
+- **Voice Activity Detection (VAD)** with configurable sensitivity settings
+- **Call transcripts** and metadata storage with PostgreSQL
+- **Call metrics tracking** (latency, audio quality, turn counts)
+- **Fault-tolerant execution** with automatic retries
+- **Session state management** with Redis for horizontal scaling
+- **Database migrations** with Alembic
+- **Monitoring** with Temporal UI, Prometheus, and Grafana
+- **Production-ready** with connection pooling and resource management
+- **AWS Infrastructure** with Terraform (ECS, RDS, ElastiCache, Global Accelerator)
 
 ## Prerequisites
 
@@ -90,6 +94,8 @@ docker compose ps
 
 ### 4. Run Database Migrations
 
+Migrations run automatically via the entrypoint script. To run manually:
+
 ```bash
 # Initialize database schema
 docker compose exec api alembic upgrade head
@@ -106,6 +112,8 @@ docker compose exec api alembic current
 
 # Or manually:
 curl http://localhost:8000/health
+curl http://localhost:8000/health/ready
+curl http://localhost:8000/health/live
 ```
 
 ### 6. Access Services
@@ -117,6 +125,7 @@ curl http://localhost:8000/health
 | **Temporal UI** | http://localhost:8080 | - |
 | **Grafana** | http://localhost:3000 | admin / admin |
 | **Prometheus** | http://localhost:9090 | - |
+| **PostgreSQL** | localhost:5433 | temporal / temporal |
 
 ### 7. Make a Test Call
 
@@ -140,6 +149,22 @@ curl -X POST http://localhost:8000/calls \
 # }
 ```
 
+**With VAD Configuration:**
+```bash
+curl -X POST http://localhost:8000/calls \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone_number": "+15551234567",
+    "greeting": "Hello! How can I help you?",
+    "system_prompt": "You are a helpful assistant.",
+    "vad_config": {
+      "start_sensitivity": "HIGH",
+      "end_sensitivity": "LOW",
+      "silence_duration_ms": 500
+    }
+  }'
+```
+
 **Monitor the call:**
 ```bash
 # Check call status
@@ -154,46 +179,78 @@ open http://localhost:8080
 ```
 voice-ai/
 ├── src/voice_ai_system/
-│   ├── workflows/          # Temporal workflow definitions
+│   ├── workflows/              # Temporal workflow definitions
 │   │   └── call_workflow.py
-│   ├── activities/         # Temporal activities (Twilio, Gemini, DB)
-│   │   ├── twilio_activities.py
-│   │   ├── gemini_activities.py
-│   │   └── database_activities.py
-│   ├── api/               # FastAPI endpoints and WebSocket handlers
+│   ├── activities/             # Temporal activities
+│   │   ├── twilio_activities.py    # Twilio API calls
+│   │   ├── database_activities.py  # Database operations
+│   │   ├── session_activities.py   # Redis session management
+│   │   └── metrics_activities.py   # Call metrics tracking
+│   ├── api/                    # FastAPI endpoints and WebSocket handlers
 │   │   ├── routes/
-│   │   │   ├── calls.py       # Call management endpoints
-│   │   │   └── twilio.py      # Twilio webhooks & WebSocket
+│   │   │   ├── calls.py            # Call management endpoints
+│   │   │   ├── twilio.py           # Twilio webhooks & WebSocket
+│   │   │   └── health.py           # Health check endpoints
 │   │   └── main.py
-│   ├── services/          # Business logic layer
-│   │   ├── audio_bridge.py    # Real-time Twilio-Gemini audio bridge
-│   │   └── call_service.py
-│   ├── models/            # Pydantic models and schemas
-│   │   └── call.py
-│   ├── utils/             # Utilities
-│   │   ├── audio.py           # Format conversion (μ-law ↔ PCM)
-│   │   ├── redis_client.py    # Redis session management
-│   │   └── logging.py
-│   ├── config.py          # Application configuration
-│   └── worker.py          # Temporal worker entry point
-├── migrations/            # Alembic database migrations
+│   ├── services/               # Business logic layer
+│   │   ├── audio_bridge.py         # Real-time Twilio-Gemini audio bridge
+│   │   ├── database.py             # Database connection management
+│   │   └── temporal_client.py      # Temporal client wrapper
+│   ├── models/                 # Pydantic models and schemas
+│   │   ├── call.py                 # Call-related models
+│   │   └── database.py             # SQLAlchemy ORM models
+│   ├── utils/                  # Utilities
+│   │   ├── audio.py                # Format conversion (u-law to PCM)
+│   │   ├── redis_client.py         # Redis session management
+│   │   └── logging.py              # Structured logging
+│   ├── config.py               # Application configuration
+│   └── worker.py               # Temporal worker entry point
+├── migrations/                 # Alembic database migrations
+│   └── versions/
+│       ├── f81484ed308c_initial_schema.py
+│       └── b88491b78a30_add_call_metrics_table.py
+├── terraform/                  # AWS Infrastructure as Code
+│   ├── environments/
+│   │   └── production/
+│   │       ├── us-east-1/          # Primary region
+│   │       └── us-west-2/          # DR standby region
+│   ├── modules/
+│   │   ├── networking/             # VPC, subnets, security groups
+│   │   ├── ecs/                    # ECS cluster and services
+│   │   ├── alb/                    # Application Load Balancer
+│   │   ├── ecr/                    # Container registry
+│   │   ├── elasticache/            # Redis cache
+│   │   ├── secrets/                # AWS Secrets Manager
+│   │   ├── monitoring/             # CloudWatch dashboard
+│   │   ├── global_accelerator/     # Multi-region routing
+│   │   └── cicd/                   # CodePipeline (optional)
+│   ├── scripts/failover/           # DR failover scripts
+│   └── README.md                   # Terraform documentation
 ├── docker/
-│   ├── Dockerfile.api     # FastAPI service
-│   ├── Dockerfile.worker  # Temporal worker
-│   ├── prometheus.yml     # Metrics configuration
-│   └── temporal-config/   # Temporal dynamic config
+│   ├── Dockerfile.api          # FastAPI service
+│   ├── Dockerfile.worker       # Temporal worker
+│   ├── prometheus.yml          # Metrics configuration
+│   └── temporal-config/        # Temporal dynamic config
 ├── scripts/
-│   ├── start-full.sh      # Start all services
-│   └── test-health.sh     # Health check script
-├── tests/                 # Test suite
-├── docs/                  # Documentation
-│   ├── architecture-diagrams.md           # Mermaid architecture diagrams
-│   └── gemini-preinitialization-analysis.md
-├── docker-compose.yml     # Multi-service orchestration
-├── pyproject.toml        # Project dependencies (uv)
-├── alembic.ini           # Alembic configuration
-├── .env                  # Environment variables (created)
-└── .env.example          # Environment template
+│   ├── entrypoint.sh           # Docker entrypoint (runs migrations)
+│   ├── start-full.sh           # Start all services
+│   ├── start-dev.sh            # Development mode
+│   ├── stop-dev.sh             # Stop development services
+│   ├── monitor.sh              # Monitoring helper
+│   └── test-health.sh          # Health check script
+├── tests/                      # Test suite
+│   ├── test_audio_conversion.py
+│   ├── test_audio_bridge_session.py
+│   ├── test_api_calls.py
+│   └── test_imports.py
+├── docs/                       # Documentation
+│   ├── architecture-diagrams.md
+│   └── VAD_CONFIGURATION.md    # Voice Activity Detection guide
+├── docker-compose.yml          # Multi-service orchestration
+├── pyproject.toml              # Project dependencies (uv)
+├── alembic.ini                 # Alembic configuration
+├── .env                        # Environment variables (created)
+└── .env.example                # Environment template
 ```
 
 ## Architecture Deep Dive
@@ -201,16 +258,15 @@ voice-ai/
 ### Call Flow Overview
 
 ```
-1. Client → POST /calls → API Server
-2. API → Start Temporal Workflow + Pre-warm Gemini session (parallel)
-3. Workflow → Execute Twilio activity → Make outbound call
-4. Phone rings → User answers
-5. Twilio → GET /twiml/{workflow_id} → Returns TwiML with WebSocket URL
-6. Twilio → WebSocket /ws/media/{workflow_id} → Connects
-7. WebSocket → Attach to pre-warmed Gemini session (instant!)
-8. User speaks → Audio flows: Twilio → Audio Bridge → Gemini → Audio Bridge → Twilio
-9. Transcripts sync to Workflow every 2 seconds (not every frame)
-10. Call ends → Workflow completes → Transcripts saved to DB
+1. Client -> POST /calls -> API Server
+2. API -> Start Temporal Workflow + Pre-warm Gemini session (parallel)
+3. Workflow -> Execute Twilio activity -> Make outbound call
+4. Phone rings -> User answers
+5. Twilio -> WebSocket /twilio/ws/media/{workflow_id} -> Connects
+6. WebSocket -> Attach to pre-warmed Gemini session (instant!)
+7. User speaks -> Audio flows: Twilio -> Audio Bridge -> Gemini -> Audio Bridge -> Twilio
+8. Transcripts sync to Workflow every 2 seconds (not every frame)
+9. Call ends -> Workflow completes -> Transcripts & metrics saved to DB
 ```
 
 ### Audio Bridge Architecture
@@ -218,34 +274,49 @@ voice-ai/
 **Key Optimization: Real-time audio processing happens OUTSIDE Temporal's hot path.**
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      FastAPI WebSocket                       │
-│  (Receives Twilio μ-law audio, sends back μ-law audio)     │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Audio Bridge Manager                       │
-│  • Pre-warms Gemini during ring time (~2s savings)         │
-│  • Direct audio streaming (bypasses Temporal)               │
-│  • Buffers transcripts for periodic sync                    │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-          ┌──────────┴──────────┐
-          ▼                     ▼
-┌──────────────────┐  ┌──────────────────┐
-│  Gemini Live API │  │ Temporal Workflow│
-│  In: 16kHz PCM   │  │ (Coarse events)  │
-│  Out: 24kHz PCM  │  │                  │
-└──────────────────┘  └──────────────────┘
-     Real-time             Every 2 seconds
-    (every 20ms)          (transcript sync)
++-------------------------------------------------------------+
+|                      FastAPI WebSocket                       |
+|  (Receives Twilio u-law 8kHz, sends back u-law 8kHz)        |
++-----------------------------+-------------------------------+
+                              |
+                              v
++-------------------------------------------------------------+
+|                   Audio Bridge Manager                       |
+|  - Pre-warms Gemini during ring time (~2s savings)          |
+|  - Direct audio streaming (bypasses Temporal)                |
+|  - Buffers transcripts for periodic sync                     |
+|  - ThreadPoolExecutor for CPU-bound audio conversion         |
++-----------------------------+-------------------------------+
+                              |
+               +--------------+--------------+
+               v                             v
++----------------------+       +----------------------+
+|   Gemini Live API    |       | Temporal Workflow    |
+|   In: 16kHz PCM      |       | (Coarse events)      |
+|   Out: 24kHz PCM     |       |                      |
++----------------------+       +----------------------+
+      Real-time                    Every 2 seconds
+     (every 20ms)                (transcript sync)
 ```
 
 **Benefits:**
-- ✅ Reduced Temporal activity load by 100x (from every 20ms to every 2s)
-- ✅ Lower latency (no Temporal round-trip for audio frames)
-- ✅ Gemini pre-warming reduces first response from 3s → 0.7s
+- Reduced Temporal activity load by 100x (from every 20ms to every 2s)
+- Lower latency (no Temporal round-trip for audio frames)
+- Gemini pre-warming reduces first response from 3s to 0.7s
+
+### Voice Activity Detection (VAD)
+
+The system uses Gemini's built-in VAD with configurable parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `disabled` | false | Enable/disable automatic VAD |
+| `start_sensitivity` | HIGH | Sensitivity for detecting speech start |
+| `end_sensitivity` | LOW | Sensitivity for detecting speech end |
+| `prefix_padding_ms` | 200 | Buffer before speech detection |
+| `silence_duration_ms` | 500 | Silence duration to end speech |
+
+See [docs/VAD_CONFIGURATION.md](docs/VAD_CONFIGURATION.md) for detailed configuration guide.
 
 ### Gemini Session Pre-Warming
 
@@ -256,20 +327,20 @@ voice-ai/
 **Timeline:**
 ```
 Before optimization:
-0s    → Call initiated
-5-30s → User answers "Hello?"
-30s   → WebSocket connects
-32s   → Gemini initialized (SLOW)
-33s   → User hears response
-      = 3s user waiting in silence ❌
+0s    -> Call initiated
+5-30s -> User answers "Hello?"
+30s   -> WebSocket connects
+32s   -> Gemini initialized (SLOW)
+33s   -> User hears response
+      = 3s user waiting in silence
 
 After optimization:
-0s    → Call initiated + Gemini pre-warming starts (parallel)
-2s    → Gemini session ready
-5-30s → User answers "Hello?"
-30s   → WebSocket connects → Uses pre-warmed session (instant!)
-30.7s → User hears response
-      = 0.7s user waiting ✅ (77% improvement)
+0s    -> Call initiated + Gemini pre-warming starts (parallel)
+2s    -> Gemini session ready
+5-30s -> User answers "Hello?"
+30s   -> WebSocket connects -> Uses pre-warmed session (instant!)
+30.7s -> User hears response
+      = 0.7s user waiting (77% improvement)
 ```
 
 ### Redis Session Management
@@ -291,6 +362,16 @@ Data: {
 TTL: 2 hours (configurable via REDIS_SESSION_TTL)
 ```
 
+### Call Metrics Tracking
+
+The system tracks comprehensive metrics for each call:
+
+- **Connection Timing**: call_initiated_at, websocket_connected_at, time_to_first_audio_ms
+- **Audio Performance**: frames_sent, frames_received, frames_dropped, drop_rate_percent
+- **VAD Metrics**: trigger_count, speech_start_count, interruption_count
+- **Turn Metrics**: ai_turn_count, user_turn_count
+- **Gemini Metrics**: session_duration_ms, model_version
+
 ## Development
 
 ### Local Development (without Docker)
@@ -307,7 +388,7 @@ docker compose ps
 # 3. Set environment variables for local connection
 export TEMPORAL_HOST=localhost
 export REDIS_HOST=localhost
-export DATABASE_URL=postgresql://temporal:temporal@localhost:5432/voice_ai
+export DATABASE_URL=postgresql://temporal:temporal@localhost:5433/voice_ai
 
 # 4. Run database migrations
 uv run alembic upgrade head
@@ -354,7 +435,7 @@ uv run pytest
 uv run pytest --cov=src --cov-report=html
 
 # Run specific test
-uv run pytest tests/test_audio_bridge.py -v
+uv run pytest tests/test_audio_conversion.py -v
 
 # Run with logs
 uv run pytest -s
@@ -387,6 +468,14 @@ uv run black src tests && uv run ruff check src tests && uv run mypy src
 | `POST` | `/calls/{workflow_id}/terminate` | Terminate active call |
 | `GET` | `/calls/{workflow_id}/result` | Get final call result |
 
+### Health Checks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Basic health check |
+| `GET` | `/health/ready` | Readiness check (Temporal connected) |
+| `GET` | `/health/live` | Liveness check |
+
 ### Twilio Webhooks
 
 | Method | Endpoint | Description |
@@ -394,6 +483,13 @@ uv run black src tests && uv run ruff check src tests && uv run mypy src
 | `POST` | `/twilio/twiml/{workflow_id}` | Generate TwiML with WebSocket |
 | `WebSocket` | `/twilio/ws/media/{workflow_id}` | Twilio Media Stream handler |
 | `POST` | `/twilio/status/{workflow_id}` | Call status callbacks |
+| `POST` | `/twilio/stream-status/{workflow_id}` | Stream status callbacks |
+
+### Metrics
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/metrics` | Prometheus metrics |
 
 ### Example: Initiate Call
 
@@ -406,7 +502,12 @@ Content-Type: application/json
   "phone_number": "+15551234567",
   "greeting": "Hello! How can I help you today?",
   "system_prompt": "You are a helpful assistant. Be concise.",
-  "max_duration_seconds": 1800
+  "max_duration_seconds": 1800,
+  "vad_config": {
+    "start_sensitivity": "HIGH",
+    "end_sensitivity": "LOW",
+    "silence_duration_ms": 500
+  }
 }
 ```
 
@@ -436,6 +537,73 @@ GET /calls/call-abc123-def456-ghi789
   }
 }
 ```
+
+## AWS Production Deployment
+
+### Infrastructure Overview
+
+The system includes Terraform modules for production AWS deployment:
+
+```
+                      +------------------+
+                      |      Twilio      |
+                      +--------+---------+
+                               |
+                      +--------v---------+
+                      |    Route 53      |
+                      +--------+---------+
+                               |
+               +---------------v---------------+
+               |    AWS Global Accelerator     |
+               +---------------+---------------+
+                               |
+         +---------------------+---------------------+
+         v                                           v
++----------------+                         +----------------+
+|   us-east-1    |                         |   us-west-2    |
+|   (PRIMARY)    |                         |   (STANDBY)    |
+|                |                         |                |
+|  ALB -> ECS    |                         |  Cold Standby  |
+|  RDS           |                         |  (VPC only)    |
+|  ElastiCache   |                         |                |
++----------------+                         +----------------+
+```
+
+### Estimated Monthly Cost: ~$155
+
+| Service | Specification | Cost |
+|---------|--------------|------|
+| ECS Fargate - API | 2 tasks @ 0.5 vCPU / 1GB | ~$36 |
+| ECS Fargate - Worker (Spot) | 2 tasks @ 0.25 vCPU / 512MB | ~$5 |
+| Application Load Balancer | 1 ALB | ~$18 |
+| RDS PostgreSQL | db.t3.micro, 20GB | ~$16 |
+| ElastiCache Redis | cache.t3.micro | ~$12 |
+| NAT Gateway | Single (1 AZ) | ~$32 |
+| Global Accelerator | Base + data | ~$20 |
+| Route 53 + CloudWatch | Misc | ~$16 |
+
+### Deploy to AWS
+
+```bash
+cd terraform/environments/production/us-east-1
+
+# Copy and configure variables
+cp terraform.tfvars.example terraform.tfvars
+
+# Set sensitive variables
+export TF_VAR_db_password="your-secure-password"
+export TF_VAR_twilio_account_sid="ACxxxxxxxxxx"
+export TF_VAR_twilio_auth_token="your-auth-token"
+export TF_VAR_twilio_phone_number="+1234567890"
+export TF_VAR_gemini_api_key="your-gemini-api-key"
+
+# Initialize and apply
+terraform init
+terraform plan
+terraform apply
+```
+
+See [terraform/README.md](terraform/README.md) for complete AWS deployment documentation.
 
 ## Monitoring
 
@@ -544,24 +712,24 @@ worker:
 
 ### Security
 
-- ✅ Enable TLS for Temporal gRPC
-- ✅ Use secrets management (AWS Secrets Manager, HashiCorp Vault)
-- ✅ Implement API authentication (JWT)
-- ✅ Enable PostgreSQL SSL
-- ✅ Rotate API keys regularly
-- ✅ Use Redis authentication (set `REDIS_PASSWORD`)
-- ✅ Configure firewall rules (only expose necessary ports)
-- ✅ Enable rate limiting on API endpoints
+- Enable TLS for Temporal gRPC
+- Use secrets management (AWS Secrets Manager, HashiCorp Vault)
+- Implement API authentication (JWT)
+- Enable PostgreSQL SSL
+- Rotate API keys regularly
+- Use Redis authentication (set `REDIS_PASSWORD`)
+- Configure firewall rules (only expose necessary ports)
+- Enable rate limiting on API endpoints
 
 ### High Availability
 
-- ✅ Run multiple worker replicas
-- ✅ Run multiple API replicas with load balancer
-- ✅ Use managed PostgreSQL (AWS RDS, Cloud SQL)
-- ✅ Deploy Temporal server in HA mode
-- ✅ Implement health checks and auto-restart
-- ✅ Use Redis Sentinel or Cluster for HA
-- ✅ Set up monitoring and alerting
+- Run multiple worker replicas
+- Run multiple API replicas with load balancer
+- Use managed PostgreSQL (AWS RDS, Cloud SQL)
+- Deploy Temporal server in HA mode
+- Implement health checks and auto-restart
+- Use Redis Sentinel or Cluster for HA
+- Set up monitoring and alerting
 
 ### Multi-Instance API Deployment
 
@@ -618,7 +786,7 @@ open http://localhost:8080
 ### Database Connection Issues
 
 ```bash
-# Check PostgreSQL health
+# Check PostgreSQL health (note: port 5433 is used)
 docker compose exec postgresql pg_isready -U temporal
 
 # Test connection
@@ -639,11 +807,11 @@ docker compose exec api alembic upgrade head
 **Symptoms:** Choppy audio, garbled speech, silence
 
 **Solutions:**
-- ✅ Check WebSocket connection stability (logs show disconnects)
-- ✅ Verify audio format conversion (μ-law ↔ PCM)
-- ✅ Monitor audio processing latency (<100ms target)
-- ✅ Check Gemini API rate limits
-- ✅ Verify network bandwidth (24kHz PCM = ~384 kbps)
+- Check WebSocket connection stability (logs show disconnects)
+- Verify audio format conversion (u-law to PCM)
+- Monitor audio processing latency (<100ms target)
+- Check Gemini API rate limits
+- Verify network bandwidth (24kHz PCM = ~384 kbps)
 
 ```bash
 # Check WebSocket logs
@@ -753,6 +921,16 @@ docker compose logs worker | grep -i "workflow.*started"
 - Implement exponential backoff in activities
 - Check your Gemini API quota
 
+### "Connection refused on port 5432"
+
+**Cause:** PostgreSQL is exposed on port 5433 (not default 5432)
+
+**Fix:**
+```bash
+# Use port 5433 for local connections
+psql -h localhost -p 5433 -U temporal -d voice_ai
+```
+
 ## Performance Optimization Tips
 
 1. **Gemini Pre-warming**: Already enabled (saves ~2s per call)
@@ -760,11 +938,13 @@ docker compose logs worker | grep -i "workflow.*started"
 3. **Redis Session Caching**: Already implemented
 4. **Worker Scaling**: Adjust `deploy.replicas` based on load
 5. **Temporal History Shards**: Already set to 512 (good for moderate load)
+6. **Audio Processing**: ThreadPoolExecutor offloads CPU-bound work
 
 ## Documentation
 
-- **Architecture Diagrams**: `docs/architecture-diagrams.md` (12 Mermaid diagrams)
-- **Gemini Pre-warming Analysis**: `docs/gemini-preinitialization-analysis.md`
+- **Architecture Diagrams**: `docs/architecture-diagrams.md` (Mermaid diagrams)
+- **VAD Configuration**: `docs/VAD_CONFIGURATION.md`
+- **Terraform (AWS)**: `terraform/README.md`
 - **API Documentation**: http://localhost:8000/docs (Swagger UI)
 - **Temporal Documentation**: https://docs.temporal.io/
 
@@ -789,4 +969,4 @@ Contributions welcome! Please:
 
 ---
 
-**Made with ❤️ using Temporal, Twilio, and Google Gemini**
+**Made with Temporal, Twilio, and Google Gemini**
